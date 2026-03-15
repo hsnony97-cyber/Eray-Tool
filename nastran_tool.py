@@ -57,9 +57,13 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback):
 
     if result.stdout:
         log_callback(result.stdout[-500:])
+
+    # NX Nastran bazen başarılı çalışsa bile return code 1 döndürür.
+    # Bu yüzden sadece return code'a değil, OP2 dosyasının varlığına bakıyoruz.
     if result.returncode != 0:
-        stderr_msg = result.stderr[-500:] if result.stderr else "Bilinmeyen hata"
-        raise RuntimeError(f"Nastran hata kodu {result.returncode}: {stderr_msg}")
+        log_callback(f"Nastran return code: {result.returncode} (OP2 kontrol ediliyor...)")
+        if result.stderr:
+            log_callback(f"Nastran stderr: {result.stderr[-500:]}")
 
     if not os.path.isfile(op2_path):
         raise FileNotFoundError(
@@ -299,9 +303,10 @@ class NastranToolApp:
             self._log("İŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo("Başarılı", "Sonuçlar CSV olarak yazıldı!"))
 
-        except Exception as e:
-            self._log(f"\nHATA: {e}")
-            self.root.after(0, lambda: messagebox.showerror("Hata", str(e)))
+        except Exception as exc:
+            error_msg = str(exc)
+            self._log(f"\nHATA: {error_msg}")
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Hata", msg))
         finally:
             self.root.after(0, self._finish)
 

@@ -80,38 +80,55 @@ def extract_von_mises_stress(op2_model, output_dir, log_callback):
     """PSHELL elemanlarının Von Mises streslerini CSV'ye yazar."""
     stress_data = []
 
-    # CQUAD4 streslerini kontrol et
-    if hasattr(op2_model, "cquad4_stress") and op2_model.cquad4_stress:
-        for subcase_id, stress_obj in op2_model.cquad4_stress.items():
-            log_callback(f"  CQUAD4 stress bulundu (subcase {subcase_id})")
-            eids = stress_obj.element
-            ovm = stress_obj.data  # (ntimes, nelements, nresults)
-            for t_idx in range(ovm.shape[0]):
-                for i, eid in enumerate(eids):
-                    # Von Mises index genelde son sütun
-                    vm_val = ovm[t_idx, i, -1]
-                    stress_data.append({
-                        "Subcase": subcase_id,
-                        "TimeStep": t_idx,
-                        "ElementID": eid,
-                        "ElementType": "CQUAD4",
-                        "VonMises": vm_val,
-                    })
+    # Plate stress sonuçlarını topla (CQUAD4, CTRIA3)
+    plate_stress_attrs = [
+        ("cquad4_stress", "CQUAD4"),
+        ("ctria3_stress", "CTRIA3"),
+    ]
 
-    # CTRIA3 streslerini kontrol et
-    if hasattr(op2_model, "ctria3_stress") and op2_model.ctria3_stress:
-        for subcase_id, stress_obj in op2_model.ctria3_stress.items():
-            log_callback(f"  CTRIA3 stress bulundu (subcase {subcase_id})")
-            eids = stress_obj.element
+    for attr_name, elem_type in plate_stress_attrs:
+        stress_dict = getattr(op2_model, attr_name, None)
+        if not stress_dict:
+            continue
+        for subcase_id, stress_obj in stress_dict.items():
+            log_callback(f"  {elem_type} stress bulundu (subcase {subcase_id})")
+
+            # element_node: (nelements, 2) -> [eid, nid] şeklinde
+            # Bazı versiyonlarda element_node, bazılarında element olabiliyor
+            if hasattr(stress_obj, "element_node"):
+                eids = stress_obj.element_node[:, 0]
+            elif hasattr(stress_obj, "element"):
+                eids = stress_obj.element
+            else:
+                log_callback(f"  UYARI: {elem_type} stress objesinde element bilgisi bulunamadı, atlanıyor.")
+                continue
+
+            # data: (ntimes, nelements, nresults)
+            # RealPlateStressArray sütunları:
+            #   [fiber_dist, oxx, oyy, txy, angle, omax, omin, von_mises]
+            # Von Mises son sütunda (index 7)
             ovm = stress_obj.data
+
+            # Sadece element center sonuçlarını al (node_id == 0 olan satırlar)
+            # element_node[:,1] == 0 -> element center
+            if hasattr(stress_obj, "element_node"):
+                node_ids = stress_obj.element_node[:, 1]
+                center_mask = node_ids == 0
+            else:
+                center_mask = None
+
             for t_idx in range(ovm.shape[0]):
-                for i, eid in enumerate(eids):
-                    vm_val = ovm[t_idx, i, -1]
+                for i in range(ovm.shape[1]):
+                    # Eğer center_mask varsa sadece center sonuçlarını al
+                    if center_mask is not None and not center_mask[i]:
+                        continue
+                    eid = int(eids[i])
+                    vm_val = float(ovm[t_idx, i, -1])
                     stress_data.append({
                         "Subcase": subcase_id,
                         "TimeStep": t_idx,
                         "ElementID": eid,
-                        "ElementType": "CTRIA3",
+                        "ElementType": elem_type,
                         "VonMises": vm_val,
                     })
 

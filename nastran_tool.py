@@ -5,9 +5,10 @@ BDF dosyasındaki PSHELL'lerin kalınlıklarını bağımsız olarak optimize ed
 Amaç: Minimum ağırlık ile displacement ve stress sınırlarını sağlamak.
 
 Algoritmalar:
-  1) Sensitivity-Based: Hassasiyet analizi ile her PSHELL'in displacement'a etkisini ölçer
-  2) SciPy Minimize: Gradient-based optimizasyon (SLSQP)
-  3) Hybrid: Uniform tarama + sensitivity ince ayar
+  1) Sensitivity-Based: Hassasiyet analizi ile optimize eder
+  2) SciPy Minimize: SLSQP gradient-based optimizasyon
+  3) Hybrid: Bisection + sensitivity ince ayar
+  4) DOE + Surrogate: Latin Hypercube ile deney tasarımı, surrogate model ile hızlı yakınsama
 """
 
 import os
@@ -47,6 +48,26 @@ def format_nastran_real(value):
     return s
 
 
+def log_thickness_table(thickness_map, max_disp, max_disp_limit, max_vm, stress_ok, log_callback):
+    """Her iterasyondan sonra kalınlık tablosunu ve displacement bilgisini ekrana yazdırır."""
+    log_callback("")
+    log_callback("  ┌─────────┬────────────┐")
+    log_callback("  │   PID   │  Kalınlık  │")
+    log_callback("  ├─────────┼────────────┤")
+    for pid in sorted(thickness_map.keys()):
+        t = thickness_map[pid]
+        log_callback(f"  │ {pid:>7} │ {t:>10.4f} │")
+    log_callback("  └─────────┴────────────┘")
+    total_t = sum(thickness_map.values())
+    log_callback(f"  Toplam Kalınlık (Ağırlık Proxy): {total_t:.4f}")
+
+    disp_status = "OK" if max_disp <= max_disp_limit else "FAIL"
+    stress_status = "OK" if stress_ok else "FAIL"
+    log_callback(f"  Max Displacement: {max_disp:.6f} / {max_disp_limit} [{disp_status}]")
+    log_callback(f"  Max Von Mises:    {max_vm:.2f} [Stress: {stress_status}]")
+    log_callback("")
+
+
 # ---------------------------------------------------------------------------
 # BDF PSHELL okuma / yazma
 # ---------------------------------------------------------------------------
@@ -68,11 +89,7 @@ def read_pshell_pids(bdf_path):
 
 
 def modify_pshell_thicknesses(bdf_path, output_bdf_path, thickness_map, log_callback=None):
-    """
-    BDF dosyasındaki PSHELL kartlarının kalınlıklarını thickness_map'e göre değiştirir.
-    thickness_map: {pid: new_thickness}
-    Tüm PSHELL'ler map'te olmalı; olmayanlar değiştirilmez.
-    """
+    """BDF dosyasındaki PSHELL kalınlıklarını thickness_map'e göre değiştirir."""
     with open(bdf_path, "r") as f:
         lines = f.readlines()
 
@@ -115,7 +132,7 @@ def modify_pshell_thicknesses(bdf_path, output_bdf_path, thickness_map, log_call
         f.writelines(new_lines)
 
     if log_callback:
-        log_callback(f"  {modified_count} PSHELL kalınlığı güncellendi.")
+        log_callback(f"  {modified_count} PSHELL güncellendi.")
     return modified_count
 
 
@@ -176,7 +193,6 @@ def get_von_mises_stresses(op2_model):
 
 
 def get_max_absolute_displacement(op2_model):
-    """Max absolute translational displacement."""
     max_disp = 0.0
     if not op2_model.displacements:
         return 0.0
@@ -190,8 +206,6 @@ def get_max_absolute_displacement(op2_model):
 
 
 def extract_results_csv(op2_model, output_dir, label, log_callback):
-    """Stress ve displacement CSV'lerini yazar."""
-    # Stress CSV
     stress_map = get_von_mises_stresses(op2_model)
     if stress_map:
         rows = [{"ElementID": eid, "VonMises": vm} for eid, vm in sorted(stress_map.items())]
@@ -200,7 +214,6 @@ def extract_results_csv(op2_model, output_dir, label, log_callback):
         df.to_csv(csv_path, index=False)
         log_callback(f"  Stress CSV: {csv_path} ({len(df)} eleman)")
 
-    # Displacement CSV
     if op2_model.displacements:
         disp_data = []
         for subcase_id, disp_obj in op2_model.displacements.items():
@@ -222,7 +235,6 @@ def extract_results_csv(op2_model, output_dir, label, log_callback):
 
 
 def load_allowable_excel(excel_path):
-    """Stress allowable Excel: {element_id: allowable}"""
     df = pd.read_excel(excel_path, sheet_name=0)
     df.columns = [c.strip() for c in df.columns]
     eid_col = df.columns[0]
@@ -231,7 +243,6 @@ def load_allowable_excel(excel_path):
 
 
 def check_stress_constraints(stress_map, allowable_map):
-    """Stress kontrolü: (ok, failed_list, max_vm)"""
     failed = []
     max_vm = 0.0
     for eid, vm in stress_map.items():
@@ -243,7 +254,7 @@ def check_stress_constraints(stress_map, allowable_map):
 
 
 def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callback):
-    """BDF'yi değiştir, çöz, sonuçları oku. Returns (max_disp, stress_map, op2_model)"""
+    """BDF'yi değiştir, çöz, sonuçları oku ve her iterasyonda CSV yaz."""
     os.makedirs(work_dir, exist_ok=True)
     bdf_basename = os.path.basename(bdf_path)
     modified_bdf = os.path.join(work_dir, bdf_basename)
@@ -255,53 +266,43 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
 
     max_disp = get_max_absolute_displacement(op2_model)
     stress_map = get_von_mises_stresses(op2_model)
+
+    # Her iterasyonda stress ve displacement CSV'lerini yaz
+    iter_label = os.path.basename(work_dir)
+    extract_results_csv(op2_model, work_dir, iter_label, log_callback)
+
     return max_disp, stress_map, op2_model
 
 
 def compute_total_weight(thickness_map):
-    """Kalınlık toplamı (ağırlık proxy'si - gerçek ağırlık alan*t*rho ama
-    karşılaştırma için sum(t) yeterli)."""
     return sum(thickness_map.values())
 
 
 # ---------------------------------------------------------------------------
-# ALGORİTMA 1: Sensitivity-Based Optimizasyon
+# ALGORİTMA 1: Sensitivity-Based
 # ---------------------------------------------------------------------------
 
 def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                          min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
-    """
-    Hassasiyet tabanlı optimizasyon:
-    1) Referans çözüm (tüm PSHELL'ler max kalınlıkta)
-    2) Her PSHELL'i step kadar incelt, hassasiyet hesapla
-    3) Displacement'a az etkisi olanları incelt, çok etkisi olanları kalın tut
-    4) Stress kontrolü ile sınırla
-    """
     n = len(pids)
     log_callback(f"\n  Toplam {n} PSHELL optimize edilecek.")
-
-    # Başlangıç: tüm PSHELL'ler max kalınlıkta
     current_t = {pid: max_t for pid in pids}
 
     for iteration in range(max_iter):
         log_callback(f"\n{'='*50}")
         log_callback(f"SENSITIVITY İTERASYON {iteration + 1}/{max_iter}")
-        log_callback(f"  Toplam kalınlık (ağırlık proxy): {compute_total_weight(current_t):.4f}")
         progress_callback((iteration / max_iter) * 100)
 
-        # Referans çözüm
         ref_dir = os.path.join(output_dir, f"sens_iter{iteration}_ref")
-        log_callback("  Referans çözüm yapılıyor...")
-        ref_disp, ref_stress, ref_op2 = solve_and_evaluate(
+        log_callback("  Referans çözüm...")
+        ref_disp, ref_stress, _ = solve_and_evaluate(
             nastran_exe, bdf_path, current_t, ref_dir, log_callback
         )
-        log_callback(f"  Ref Max Disp: {ref_disp:.6f} (Limit: {max_disp_limit})")
 
         stress_ok, failed, max_vm = check_stress_constraints(ref_stress, allowable_map)
-        log_callback(f"  Ref Max VM: {max_vm:.2f}, Stress OK: {stress_ok}")
+        log_thickness_table(current_t, ref_disp, max_disp_limit, max_vm, stress_ok, log_callback)
 
         if not stress_ok:
-            # Stress aşan elemanların PSHELL'lerini kalınlaştır
             log_callback(f"  {len(failed)} eleman stress aşıyor, kalınlaştırılıyor...")
             for eid, vm, allow in failed:
                 for pid in pids:
@@ -310,42 +311,37 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             continue
 
         if ref_disp > max_disp_limit:
-            log_callback("  Displacement limiti aşılıyor, kalınlık artırılamaz!")
+            log_callback("  Displacement limiti aşılıyor!")
             break
 
-        # Hassasiyet analizi: her PSHELL'i step kadar incelt ve etkisini ölç
+        # Hassasiyet analizi
         log_callback("  Hassasiyet analizi yapılıyor...")
         sensitivities = {}
-        delta_t = step
 
         for i, pid in enumerate(pids):
             if current_t[pid] <= min_t + 1e-9:
-                sensitivities[pid] = float('inf')  # Zaten minimum, daha incelmez
+                sensitivities[pid] = float('inf')
                 continue
 
             perturbed_t = dict(current_t)
-            perturbed_t[pid] = current_t[pid] - delta_t
+            perturbed_t[pid] = current_t[pid] - step
 
             pert_dir = os.path.join(output_dir, f"sens_iter{iteration}_p{pid}")
             try:
                 pert_disp, pert_stress, _ = solve_and_evaluate(
                     nastran_exe, bdf_path, perturbed_t, pert_dir, log_callback
                 )
-                # dDisp/dT: displacement'ın kalınlık azalmasına duyarlılığı
-                sensitivity = (pert_disp - ref_disp) / delta_t
+                sensitivity = (pert_disp - ref_disp) / step
                 sensitivities[pid] = sensitivity
 
-                # Stress kontrolü
-                s_ok, s_failed, _ = check_stress_constraints(pert_stress, allowable_map)
+                s_ok, _, _ = check_stress_constraints(pert_stress, allowable_map)
                 if not s_ok:
-                    sensitivities[pid] = float('inf')  # Stress aşıyor, inceltme
-
+                    sensitivities[pid] = float('inf')
             except Exception:
                 sensitivities[pid] = float('inf')
 
-            log_callback(f"    PID {pid}: sens = {sensitivities[pid]:.6f} ({i+1}/{n})")
+            log_callback(f"    PID {pid}: dDisp/dT = {sensitivities[pid]:.6f} ({i+1}/{n})")
 
-        # En az hassas olanları incelt (displacement'ı az etkileyenler)
         sorted_pids = sorted(
             [p for p in pids if sensitivities[p] < float('inf')],
             key=lambda p: abs(sensitivities[p])
@@ -355,7 +351,6 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             log_callback("  Hiçbir PSHELL daha fazla inceltilemez.")
             break
 
-        # Alt %50'sini incelt
         n_reduce = max(1, len(sorted_pids) // 2)
         reduced_any = False
         for pid in sorted_pids[:n_reduce]:
@@ -365,7 +360,7 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 reduced_any = True
 
         if not reduced_any:
-            log_callback("  Minimum kalınlığa ulaşıldı, iterasyon durduruluyor.")
+            log_callback("  Minimum kalınlığa ulaşıldı.")
             break
 
         log_callback(f"  {n_reduce} PSHELL incelendi.")
@@ -378,6 +373,8 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         nastran_exe, bdf_path, current_t, final_dir, log_callback
     )
     extract_results_csv(final_op2, final_dir, "final", log_callback)
+    stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
+    log_thickness_table(current_t, final_disp, max_disp_limit, max_vm, stress_ok, log_callback)
 
     progress_callback(100)
     return current_t, final_disp, final_stress
@@ -389,23 +386,18 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
 def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                    min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
-    """SciPy SLSQP ile gradient-based optimizasyon."""
     from scipy.optimize import minimize
 
     n = len(pids)
     eval_count = [0]
-
-    log_callback(f"\n  SciPy SLSQP Optimizasyon - {n} PSHELL")
+    log_callback(f"\n  SciPy SLSQP - {n} PSHELL")
 
     def objective(x):
-        """Minimize: toplam kalınlık (ağırlık proxy)"""
         return np.sum(x)
 
     def disp_constraint(x):
-        """Constraint: max_disp_limit - max_disp >= 0"""
         eval_count[0] += 1
         t_map = {pid: float(x[i]) for i, pid in enumerate(pids)}
-
         work_dir = os.path.join(output_dir, f"scipy_eval{eval_count[0]}")
         log_callback(f"\n  Eval #{eval_count[0]}: sum(t) = {np.sum(x):.4f}")
         progress_callback(min(eval_count[0] / max_iter * 100, 99))
@@ -414,78 +406,46 @@ def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             max_disp, stress_map, _ = solve_and_evaluate(
                 nastran_exe, bdf_path, t_map, work_dir, log_callback
             )
-            log_callback(f"  Max Disp: {max_disp:.6f}")
+            stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+            log_thickness_table(t_map, max_disp, max_disp_limit, max_vm, stress_ok, log_callback)
             return max_disp_limit - max_disp
         except Exception as exc:
             log_callback(f"  Nastran hatası: {exc}")
-            return -1.0  # Infeasible
-
-    def stress_constraint(x):
-        """Constraint: min(allowable - vm) >= 0 (tüm elemanlar için)"""
-        t_map = {pid: float(x[i]) for i, pid in enumerate(pids)}
-        work_dir = os.path.join(output_dir, f"scipy_stress_eval{eval_count[0]}")
-
-        try:
-            _, stress_map, _ = solve_and_evaluate(
-                nastran_exe, bdf_path, t_map, work_dir, log_callback
-            )
-            min_margin = float('inf')
-            for eid, vm in stress_map.items():
-                if eid in allowable_map:
-                    margin = allowable_map[eid] - vm
-                    if margin < min_margin:
-                        min_margin = margin
-            return min_margin if min_margin < float('inf') else 0.0
-        except Exception:
             return -1.0
 
-    # Başlangıç noktası: orta kalınlık
     x0 = np.full(n, (min_t + max_t) / 2.0)
     bounds = [(min_t, max_t)] * n
-
-    constraints = [
-        {"type": "ineq", "fun": disp_constraint},
-    ]
+    constraints = [{"type": "ineq", "fun": disp_constraint}]
 
     result = minimize(
-        objective, x0,
-        method="SLSQP",
-        bounds=bounds,
-        constraints=constraints,
+        objective, x0, method="SLSQP", bounds=bounds, constraints=constraints,
         options={"maxiter": max_iter, "ftol": step / 10, "eps": step},
     )
 
     log_callback(f"\n  SciPy sonucu: {result.message}")
-    log_callback(f"  Toplam eval: {eval_count[0]}")
-
     final_t = {pid: round(float(result.x[i]), 8) for i, pid in enumerate(pids)}
 
-    # Son çözüm
     final_dir = os.path.join(output_dir, "final_result")
     final_disp, final_stress, final_op2 = solve_and_evaluate(
         nastran_exe, bdf_path, final_t, final_dir, log_callback
     )
     extract_results_csv(final_op2, final_dir, "final", log_callback)
+    stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
+    log_thickness_table(final_t, final_disp, max_disp_limit, max_vm, stress_ok, log_callback)
 
     progress_callback(100)
     return final_t, final_disp, final_stress
 
 
 # ---------------------------------------------------------------------------
-# ALGORİTMA 3: Hybrid (Uniform Tarama + Sensitivity)
+# ALGORİTMA 3: Hybrid (Bisection + Sensitivity)
 # ---------------------------------------------------------------------------
 
 def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
-    """
-    1) Uniform tarama: tüm PSHELL'lere aynı kalınlık vererek max'tan min'e doğru tara,
-       displacement limitini sağlayan minimum uniform kalınlığı bul (bisection).
-    2) Bu kalınlığı başlangıç noktası olarak sensitivity optimizasyonuna ver.
-    """
-    log_callback("\n  AŞAMA 1: Bisection ile başlangıç kalınlığı bulunuyor...")
+    log_callback("\n  AŞAMA 1: Bisection ile başlangıç kalınlığı...")
 
-    low = min_t
-    high = max_t
+    low, high = min_t, max_t
     best_uniform_t = max_t
     bisect_iter = 0
     max_bisect = 20
@@ -496,7 +456,7 @@ def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         t_map = {pid: mid for pid in pids}
 
         work_dir = os.path.join(output_dir, f"bisect_{bisect_iter}")
-        log_callback(f"  Bisection #{bisect_iter}: t = {mid}")
+        log_callback(f"\n  Bisection #{bisect_iter}: t = {mid}")
         progress_callback(bisect_iter / (max_bisect + max_iter) * 100)
 
         try:
@@ -504,8 +464,7 @@ def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 nastran_exe, bdf_path, t_map, work_dir, log_callback
             )
             stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
-            log_callback(f"    Disp: {max_disp:.6f}, VM: {max_vm:.2f}, "
-                         f"Disp OK: {max_disp <= max_disp_limit}, Stress OK: {stress_ok}")
+            log_thickness_table(t_map, max_disp, max_disp_limit, max_vm, stress_ok, log_callback)
 
             if max_disp <= max_disp_limit and stress_ok:
                 best_uniform_t = mid
@@ -516,21 +475,215 @@ def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             log_callback(f"    Nastran hatası: {exc}")
             low = mid
 
-    log_callback(f"\n  Bisection sonucu: uniform t = {best_uniform_t}")
-    log_callback(f"\n  AŞAMA 2: Sensitivity ile ince ayar yapılıyor...")
+    log_callback(f"\n  Bisection sonucu: t = {best_uniform_t}")
+    log_callback(f"\n  AŞAMA 2: Sensitivity ile ince ayar...")
 
-    # Sensitivity optimizasyonu, bisection sonucundan başla
-    # Ama max_t yerine best_uniform_t'den başlat
     remaining_iter = max(3, max_iter - bisect_iter)
-    result_t, final_disp, final_stress = optimize_sensitivity(
-        bdf_path, nastran_exe,
-        os.path.join(output_dir, "sensitivity_phase"),
-        pids, allowable_map,
-        min_t, best_uniform_t, step, max_disp_limit, remaining_iter,
+    return optimize_sensitivity(
+        bdf_path, nastran_exe, os.path.join(output_dir, "sensitivity_phase"),
+        pids, allowable_map, min_t, best_uniform_t, step, max_disp_limit, remaining_iter,
         log_callback, progress_callback
     )
 
-    return result_t, final_disp, final_stress
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 4: DOE + Surrogate Model
+# ---------------------------------------------------------------------------
+
+def latin_hypercube_sampling(n_samples, n_vars, min_vals, max_vals, seed=42):
+    """Latin Hypercube Sampling ile deney noktaları üretir."""
+    rng = np.random.RandomState(seed)
+    result = np.zeros((n_samples, n_vars))
+
+    for j in range(n_vars):
+        # Her değişken için n_samples aralığa böl, her aralıktan bir nokta seç
+        cut = np.linspace(0, 1, n_samples + 1)
+        uniform_samples = rng.uniform(low=cut[:-1], high=cut[1:])
+        rng.shuffle(uniform_samples)
+        result[:, j] = min_vals[j] + uniform_samples * (max_vals[j] - min_vals[j])
+
+    return result
+
+
+def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                           min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
+    """
+    DOE (Design of Experiments) + Surrogate Model optimizasyonu:
+
+    1) Latin Hypercube Sampling ile rastgele thickness kombinasyonları üret
+    2) Her birini Nastran'da çöz
+    3) Sonuçlardan bir surrogate model (linear regression) oluştur:
+       displacement = f(t1, t2, ..., tn)
+    4) Surrogate model ile optimal noktayı bul
+    5) Gerçek Nastran ile doğrula
+    6) Doğrulama sonucunu ekleyerek modeli güncelle, tekrarla
+    """
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import PolynomialFeatures
+    from scipy.optimize import minimize
+
+    n_vars = len(pids)
+    min_vals = np.full(n_vars, min_t)
+    max_vals = np.full(n_vars, max_t)
+
+    # DOE numune sayısı: en az 2*n_vars+1, en fazla max_iter'in yarısı
+    n_doe_samples = min(max(2 * n_vars + 1, 10), max(max_iter // 2, 5))
+
+    log_callback(f"\n  DOE + Surrogate Model Optimizasyon")
+    log_callback(f"  {n_vars} PSHELL, {n_doe_samples} DOE numune")
+    log_callback(f"\n  AŞAMA 1: Latin Hypercube Sampling ile deney tasarımı...")
+
+    # LHS ile numune üret
+    samples = latin_hypercube_sampling(n_doe_samples, n_vars, min_vals, max_vals)
+
+    # Her numune için Nastran çöz
+    X_train = []
+    y_disp = []
+    y_weight = []
+    y_stress_ok = []
+
+    for i in range(n_doe_samples):
+        t_map = {pid: round(float(samples[i, j]), 8) for j, pid in enumerate(pids)}
+        work_dir = os.path.join(output_dir, f"doe_sample_{i}")
+        log_callback(f"\n  DOE Numune {i+1}/{n_doe_samples}")
+        progress_callback((i / n_doe_samples) * 40)
+
+        try:
+            max_disp, stress_map, _ = solve_and_evaluate(
+                nastran_exe, bdf_path, t_map, work_dir, log_callback
+            )
+            stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+            log_thickness_table(t_map, max_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+
+            X_train.append(samples[i])
+            y_disp.append(max_disp)
+            y_weight.append(compute_total_weight(t_map))
+            y_stress_ok.append(1.0 if stress_ok else 0.0)
+        except Exception as exc:
+            log_callback(f"    Nastran hatası: {exc}")
+
+    if len(X_train) < 3:
+        raise RuntimeError("Yeterli DOE numunesi çözülemedi!")
+
+    X_train = np.array(X_train)
+    y_disp = np.array(y_disp)
+    y_weight = np.array(y_weight)
+
+    # DOE sonuçlarını CSV'ye kaydet
+    doe_rows = []
+    for i in range(len(X_train)):
+        row = {"Sample": i + 1, "MaxDisp": y_disp[i], "TotalWeight": y_weight[i]}
+        for j, pid in enumerate(pids):
+            row[f"PID_{pid}"] = X_train[i, j]
+        doe_rows.append(row)
+    doe_df = pd.DataFrame(doe_rows)
+    doe_csv = os.path.join(output_dir, "doe_samples.csv")
+    doe_df.to_csv(doe_csv, index=False)
+    log_callback(f"\n  DOE sonuçları: {doe_csv}")
+
+    # AŞAMA 2: Surrogate model oluştur ve iteratif olarak iyileştir
+    log_callback(f"\n  AŞAMA 2: Surrogate model ile optimizasyon...")
+
+    remaining_iter = max_iter - n_doe_samples
+    best_t = None
+    best_disp = float('inf')
+    best_weight = float('inf')
+
+    for surr_iter in range(max(remaining_iter, 3)):
+        log_callback(f"\n{'='*50}")
+        log_callback(f"SURROGATE İTERASYON {surr_iter + 1}")
+        progress_callback(40 + (surr_iter / max(remaining_iter, 3)) * 50)
+
+        # Polynomial features ile surrogate model (2. derece)
+        # n_vars büyükse sadece 1. derece kullan (hafıza tasarrufu)
+        degree = 1 if n_vars > 20 else 2
+        poly = PolynomialFeatures(degree=degree, include_bias=True)
+        X_poly = poly.fit_transform(X_train)
+
+        model = Ridge(alpha=1.0)
+        model.fit(X_poly, y_disp)
+
+        train_r2 = model.score(X_poly, y_disp)
+        log_callback(f"  Surrogate R²: {train_r2:.4f} ({len(X_train)} veri noktası)")
+
+        # Surrogate model ile optimize et:
+        # minimize sum(t) subject to predicted_disp <= max_disp_limit
+        def surrogate_objective(x):
+            return np.sum(x)
+
+        def surrogate_disp_constraint(x):
+            x_poly = poly.transform(x.reshape(1, -1))
+            predicted_disp = model.predict(x_poly)[0]
+            return max_disp_limit - predicted_disp
+
+        bounds = [(min_t, max_t)] * n_vars
+        x0 = np.mean(X_train, axis=0)
+
+        opt_result = minimize(
+            surrogate_objective, x0, method="SLSQP",
+            bounds=bounds,
+            constraints=[{"type": "ineq", "fun": surrogate_disp_constraint}],
+            options={"maxiter": 200},
+        )
+
+        candidate_t = {pid: round(float(opt_result.x[j]), 8) for j, pid in enumerate(pids)}
+
+        # Surrogate tahmini
+        x_cand_poly = poly.transform(opt_result.x.reshape(1, -1))
+        predicted_disp = model.predict(x_cand_poly)[0]
+        log_callback(f"  Surrogate tahmin: Disp = {predicted_disp:.6f}, Weight = {np.sum(opt_result.x):.4f}")
+
+        # Gerçek Nastran ile doğrula
+        log_callback(f"  Nastran ile doğrulama...")
+        verify_dir = os.path.join(output_dir, f"surrogate_verify_{surr_iter}")
+        try:
+            real_disp, real_stress, real_op2 = solve_and_evaluate(
+                nastran_exe, bdf_path, candidate_t, verify_dir, log_callback
+            )
+            stress_ok, failed, max_vm = check_stress_constraints(real_stress, allowable_map)
+            log_thickness_table(candidate_t, real_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+
+            error = abs(real_disp - predicted_disp)
+            log_callback(f"  Tahmin hatası: {error:.6f} ({error/max(real_disp,1e-9)*100:.1f}%)")
+
+            # Eğitim verisine ekle
+            X_train = np.vstack([X_train, opt_result.x.reshape(1, -1)])
+            y_disp = np.append(y_disp, real_disp)
+
+            weight = compute_total_weight(candidate_t)
+            if real_disp <= max_disp_limit and stress_ok and weight < best_weight:
+                best_t = dict(candidate_t)
+                best_disp = real_disp
+                best_weight = weight
+                log_callback(f"  *** YENİ EN İYİ: Weight = {best_weight:.4f}, Disp = {best_disp:.6f}")
+
+            # Yakınsama kontrolü
+            if error < step / 10 and real_disp <= max_disp_limit and stress_ok:
+                log_callback(f"  Yakınsadı! Tahmin hatası yeterince küçük.")
+                break
+
+        except Exception as exc:
+            log_callback(f"  Doğrulama hatası: {exc}")
+
+    # En iyi sonuç yoksa, feasible olan en düşük ağırlığı seç
+    if best_t is None:
+        log_callback("\n  UYARI: Feasible çözüm bulunamadı, en düşük disp'li noktayı kullanıyorum.")
+        best_idx = np.argmin(y_disp)
+        best_t = {pid: round(float(X_train[best_idx, j]), 8) for j, pid in enumerate(pids)}
+
+    # Son çözüm
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress, final_op2 = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t, final_dir, log_callback
+    )
+    extract_results_csv(final_op2, final_dir, "final", log_callback)
+    stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
+    log_thickness_table(best_t, final_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+
+    progress_callback(100)
+    return best_t, final_disp, final_stress
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +752,6 @@ class NastranToolApp:
         param_frame = ttk.LabelFrame(main_frame, text="Optimizasyon Parametreleri", padding=8)
         param_frame.grid(row=row, column=0, columnspan=5, sticky=tk.EW, pady=4)
 
-        # Satır 0: Min / Max / Step
         ttk.Label(param_frame, text="Min Kalınlık:").grid(row=0, column=0, sticky=tk.W, padx=4)
         self.min_t_entry = ttk.Entry(param_frame, width=10)
         self.min_t_entry.grid(row=0, column=1, padx=4)
@@ -615,7 +767,6 @@ class NastranToolApp:
         self.step_entry.grid(row=0, column=5, padx=4)
         self.step_entry.insert(0, "0.1")
 
-        # Satır 1: Max Disp / Max Iter
         ttk.Label(param_frame, text="Max Disp:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=(6, 0))
         self.max_disp_entry = ttk.Entry(param_frame, width=10)
         self.max_disp_entry.grid(row=1, column=1, padx=4, pady=(6, 0))
@@ -624,19 +775,19 @@ class NastranToolApp:
         ttk.Label(param_frame, text="Max İterasyon:").grid(row=1, column=2, sticky=tk.W, padx=4, pady=(6, 0))
         self.max_iter_entry = ttk.Entry(param_frame, width=10)
         self.max_iter_entry.grid(row=1, column=3, padx=4, pady=(6, 0))
-        self.max_iter_entry.insert(0, "10")
+        self.max_iter_entry.insert(0, "20")
 
-        # Satır 2: Algoritma seçimi
         ttk.Label(param_frame, text="Algoritma:").grid(row=2, column=0, sticky=tk.W, padx=4, pady=(6, 0))
-        self.algo_var = tk.StringVar(value="sensitivity")
-        algo_combo = ttk.Combobox(param_frame, textvariable=self.algo_var, state="readonly", width=30)
+        self.algo_var = tk.StringVar()
+        algo_combo = ttk.Combobox(param_frame, textvariable=self.algo_var, state="readonly", width=35)
         algo_combo["values"] = (
             "Sensitivity-Based",
             "SciPy Minimize (SLSQP)",
-            "Hybrid (Uniform + Sensitivity)",
+            "Hybrid (Bisection + Sensitivity)",
+            "DOE + Surrogate Model (Önerilen)",
         )
-        algo_combo.current(0)
-        algo_combo.grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=4, pady=(6, 0))
+        algo_combo.current(3)
+        algo_combo.grid(row=2, column=1, columnspan=4, sticky=tk.W, padx=4, pady=(6, 0))
 
         main_frame.columnconfigure(1, weight=1)
 
@@ -728,7 +879,6 @@ class NastranToolApp:
             op2_path = run_nastran(nastran_exe, bdf_path, output_dir, self._log)
             op2_model = OP2()
             op2_model.read_op2(op2_path)
-
             extract_results_csv(op2_model, output_dir, "result", self._log)
 
             max_disp = get_max_absolute_displacement(op2_model)
@@ -788,18 +938,21 @@ class NastranToolApp:
             self._log(f"  Max Disp: {max_disp_limit}  Max İter: {max_iter}")
             self._log("=" * 60)
 
-            # PSHELL PID'lerini oku
             pids = read_pshell_pids(bdf_path)
             if not pids:
                 raise ValueError("BDF dosyasında PSHELL kartı bulunamadı!")
             self._log(f"\n  {len(pids)} PSHELL bulundu: {pids[:10]}{'...' if len(pids) > 10 else ''}")
 
-            # Allowable oku
             allowable_map = load_allowable_excel(excel_path)
             self._log(f"  {len(allowable_map)} element allowable yüklendi.")
 
-            # Algoritma seç ve çalıştır
-            if "Sensitivity" in algo_name and "Hybrid" not in algo_name:
+            if "DOE" in algo_name:
+                result_t, final_disp, final_stress = optimize_doe_surrogate(
+                    bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                    min_t, max_t, step, max_disp_limit, max_iter,
+                    self._log, self._set_progress
+                )
+            elif "Sensitivity" in algo_name and "Hybrid" not in algo_name:
                 result_t, final_disp, final_stress = optimize_sensitivity(
                     bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
@@ -811,7 +964,7 @@ class NastranToolApp:
                     min_t, max_t, step, max_disp_limit, max_iter,
                     self._log, self._set_progress
                 )
-            else:  # Hybrid
+            else:
                 result_t, final_disp, final_stress = optimize_hybrid(
                     bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
@@ -821,23 +974,14 @@ class NastranToolApp:
             # Sonuç raporu
             self._log(f"\n{'='*60}")
             self._log("OPTİMİZASYON SONUÇLARI")
-            self._log(f"  Max Displacement: {final_disp:.6f} (Limit: {max_disp_limit})")
             stress_ok, failed, max_vm = check_stress_constraints(final_stress, allowable_map)
-            self._log(f"  Max Von Mises: {max_vm:.2f}")
-            self._log(f"  Displacement OK: {final_disp <= max_disp_limit}")
-            self._log(f"  Stress OK: {stress_ok}")
-            self._log(f"  Toplam Kalınlık: {compute_total_weight(result_t):.4f}")
+            log_thickness_table(result_t, final_disp, max_disp_limit, max_vm, stress_ok, self._log)
 
-            # Kalınlık dağılımı CSV
             t_rows = [{"PID": pid, "Thickness": t} for pid, t in sorted(result_t.items())]
             t_df = pd.DataFrame(t_rows)
             t_csv = os.path.join(output_dir, "optimized_thicknesses.csv")
             t_df.to_csv(t_csv, index=False)
-            self._log(f"\n  Kalınlık dağılımı: {t_csv}")
-
-            self._log("\n  PSHELL Kalınlık Dağılımı:")
-            for pid, t in sorted(result_t.items()):
-                self._log(f"    PID {pid}: {t:.4f}")
+            self._log(f"  Kalınlık dağılımı: {t_csv}")
 
             self._log("\nİŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo(

@@ -1,16 +1,16 @@
 """
-Eray-Tool: NX Nastran Thickness Iteration & OP2 Results Extraction Tool
+Eray-Tool: NX Nastran Thickness Optimization Tool
 
-BDF dosyasındaki tüm PSHELL kalınlıklarını min'den max'a iterasyon ile değiştirerek
-NX Nastran ile çözer. Her iterasyonda:
-  - Max absolute displacement kontrolü
-  - Element bazlı Von Mises stress allowable kontrolü
-yaparak en uygun kalınlığı bulur. Sonuçları CSV olarak dışarı aktarır.
+BDF dosyasındaki PSHELL'lerin kalınlıklarını bağımsız olarak optimize eder.
+Amaç: Minimum ağırlık ile displacement ve stress sınırlarını sağlamak.
+
+Algoritmalar:
+  1) Sensitivity-Based: Hassasiyet analizi ile her PSHELL'in displacement'a etkisini ölçer
+  2) SciPy Minimize: Gradient-based optimizasyon (SLSQP)
+  3) Hybrid: Uniform tarama + sensitivity ince ayar
 """
 
 import os
-import re
-import shutil
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -39,41 +39,73 @@ def select_directory(entry, title):
         entry.insert(0, path)
 
 
+def format_nastran_real(value):
+    """Nastran real format: integer değerlerde bile ondalık nokta olmalı (2 -> 2.0)"""
+    s = f"{value:g}"
+    if "." not in s and "e" not in s.lower():
+        s += ".0"
+    return s
+
+
 # ---------------------------------------------------------------------------
-# BDF PSHELL thickness değiştirme
+# BDF PSHELL okuma / yazma
 # ---------------------------------------------------------------------------
 
-def modify_pshell_thickness(bdf_path, output_bdf_path, new_thickness, log_callback):
+def read_pshell_pids(bdf_path):
+    """BDF dosyasından PSHELL PID listesini okur."""
+    pids = []
+    with open(bdf_path, "r") as f:
+        for line in f:
+            if line.upper().startswith("PSHELL"):
+                if "," in line:
+                    parts = line.split(",")
+                    pids.append(int(parts[1].strip()))
+                else:
+                    pid_field = line[8:16].strip()
+                    if pid_field:
+                        pids.append(int(pid_field))
+    return pids
+
+
+def modify_pshell_thicknesses(bdf_path, output_bdf_path, thickness_map, log_callback=None):
     """
-    BDF dosyasındaki tüm PSHELL kartlarının kalınlık (T) alanını değiştirir.
-    Nastran fixed-format (8 karakter alan) ve free-format (virgüllü) destekler.
+    BDF dosyasındaki PSHELL kartlarının kalınlıklarını thickness_map'e göre değiştirir.
+    thickness_map: {pid: new_thickness}
+    Tüm PSHELL'ler map'te olmalı; olmayanlar değiştirilmez.
     """
     with open(bdf_path, "r") as f:
         lines = f.readlines()
 
     modified_count = 0
     new_lines = []
-    thickness_str = f"{new_thickness:.6g}"
 
     for line in lines:
-        # Free-format: PSHELL ile başlayan ve virgül içeren satırlar
         if line.upper().startswith("PSHELL") and "," in line:
             parts = line.split(",")
-            # PSHELL, PID, MID1, T, ...
             if len(parts) >= 4:
-                parts[3] = thickness_str
-                new_lines.append(",".join(parts))
-                modified_count += 1
+                pid = int(parts[1].strip())
+                if pid in thickness_map:
+                    parts[3] = format_nastran_real(thickness_map[pid])
+                    new_lines.append(",".join(parts))
+                    modified_count += 1
+                else:
+                    new_lines.append(line)
             else:
                 new_lines.append(line)
-        # Fixed-format: 8 karakter genişliğinde alanlar
         elif line.upper().startswith("PSHELL"):
-            # Alan 1: PSHELL (0:8), Alan 2: PID (8:16), Alan 3: MID1 (16:24), Alan 4: T (24:32)
             if len(line) >= 32:
-                t_field = f"{new_thickness:8g}"
-                new_line = line[:24] + t_field + line[32:]
-                new_lines.append(new_line)
-                modified_count += 1
+                pid_field = line[8:16].strip()
+                if pid_field:
+                    pid = int(pid_field)
+                    if pid in thickness_map:
+                        t_field = format_nastran_real(thickness_map[pid]).rjust(8)
+                        new_line = line[:24] + t_field + line[32:]
+                        new_lines.append(new_line)
+                        modified_count += 1
+                    else:
+                        new_lines.append(line)
+                else:
+                    new_lines.append(line)
             else:
                 new_lines.append(line)
         else:
@@ -82,7 +114,8 @@ def modify_pshell_thickness(bdf_path, output_bdf_path, new_thickness, log_callba
     with open(output_bdf_path, "w") as f:
         f.writelines(new_lines)
 
-    log_callback(f"  {modified_count} PSHELL kartının kalınlığı {new_thickness} olarak değiştirildi.")
+    if log_callback:
+        log_callback(f"  {modified_count} PSHELL kalınlığı güncellendi.")
     return modified_count
 
 
@@ -94,32 +127,19 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback):
     bdf_basename = os.path.splitext(os.path.basename(bdf_path))[0]
     op2_path = os.path.join(output_dir, bdf_basename + ".op2")
 
-    cmd = [
-        nastran_exe,
-        bdf_path,
-        f"out={output_dir}{os.sep}{bdf_basename}",
-    ]
-
-    log_callback(f"  Nastran komutu: {' '.join(cmd)}")
-    log_callback("  Nastran çalışıyor...")
+    cmd = [nastran_exe, bdf_path, f"out={output_dir}{os.sep}{bdf_basename}"]
+    log_callback(f"  Nastran: {bdf_basename}")
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=output_dir)
 
-    if result.stdout:
-        log_callback(result.stdout[-300:])
-
     if result.returncode != 0:
         log_callback(f"  Nastran return code: {result.returncode}")
-        if result.stderr:
-            log_callback(f"  Nastran stderr: {result.stderr[-300:]}")
 
     if not os.path.isfile(op2_path):
         raise FileNotFoundError(
-            f"OP2 dosyası bulunamadı: {op2_path}\n"
-            "BDF dosyanızda 'PARAM,POST,-1' olduğundan emin olunuz."
+            f"OP2 bulunamadı: {op2_path}\n"
+            "BDF'de 'PARAM,POST,-1' olduğundan emin olunuz."
         )
-
-    log_callback(f"  OP2 oluşturuldu: {op2_path}")
     return op2_path
 
 
@@ -128,126 +148,389 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback):
 # ---------------------------------------------------------------------------
 
 def get_von_mises_stresses(op2_model):
-    """OP2'den element bazlı Von Mises streslerini dict olarak döndürür: {eid: max_vm}"""
+    """OP2'den element bazlı max Von Mises: {eid: max_vm}"""
     stress_map = {}
-
-    plate_stress_attrs = [
-        ("cquad4_stress", "CQUAD4"),
-        ("ctria3_stress", "CTRIA3"),
-    ]
-
-    for attr_name, elem_type in plate_stress_attrs:
+    for attr_name in ("cquad4_stress", "ctria3_stress"):
         stress_dict = getattr(op2_model, attr_name, None)
         if not stress_dict:
             continue
         for subcase_id, stress_obj in stress_dict.items():
             if hasattr(stress_obj, "element_node"):
                 eids = stress_obj.element_node[:, 0]
-                node_ids = stress_obj.element_node[:, 1]
-                center_mask = node_ids == 0
+                center_mask = stress_obj.element_node[:, 1] == 0
             elif hasattr(stress_obj, "element"):
                 eids = stress_obj.element
                 center_mask = None
             else:
                 continue
-
-            ovm = stress_obj.data  # (ntimes, nelements, nresults)
-
+            ovm = stress_obj.data
             for t_idx in range(ovm.shape[0]):
                 for i in range(ovm.shape[1]):
                     if center_mask is not None and not center_mask[i]:
                         continue
                     eid = int(eids[i])
                     vm_val = float(ovm[t_idx, i, -1])
-                    # Her eleman için maksimum VM değerini tut
                     if eid not in stress_map or vm_val > stress_map[eid]:
                         stress_map[eid] = vm_val
-
     return stress_map
 
 
 def get_max_absolute_displacement(op2_model):
-    """OP2'den tüm nodeların max absolute displacement değerini döndürür."""
+    """Max absolute translational displacement."""
     max_disp = 0.0
-
     if not op2_model.displacements:
         return 0.0
-
     for subcase_id, disp_obj in op2_model.displacements.items():
-        data = disp_obj.data  # (ntimes, nnodes, 6) -> T1,T2,T3,R1,R2,R3
-        # Translasyonel displacement: T1, T2, T3 (ilk 3 sütun)
-        translations = data[:, :, :3]
+        translations = disp_obj.data[:, :, :3]
         magnitudes = np.sqrt(np.sum(translations ** 2, axis=2))
         current_max = float(np.max(magnitudes))
         if current_max > max_disp:
             max_disp = current_max
-
     return max_disp
 
 
-def extract_von_mises_stress_csv(op2_model, output_dir, thickness, log_callback):
-    """Von Mises streslerini CSV'ye yazar."""
+def extract_results_csv(op2_model, output_dir, label, log_callback):
+    """Stress ve displacement CSV'lerini yazar."""
+    # Stress CSV
     stress_map = get_von_mises_stresses(op2_model)
-    if not stress_map:
-        log_callback("  UYARI: Stress verisi bulunamadı.")
-        return None
+    if stress_map:
+        rows = [{"ElementID": eid, "VonMises": vm} for eid, vm in sorted(stress_map.items())]
+        df = pd.DataFrame(rows)
+        csv_path = os.path.join(output_dir, f"von_mises_{label}.csv")
+        df.to_csv(csv_path, index=False)
+        log_callback(f"  Stress CSV: {csv_path} ({len(df)} eleman)")
 
-    rows = [{"ElementID": eid, "VonMises": vm, "Thickness": thickness}
-            for eid, vm in sorted(stress_map.items())]
-    df = pd.DataFrame(rows)
-    csv_path = os.path.join(output_dir, f"von_mises_stress_t{thickness:.4g}.csv")
-    df.to_csv(csv_path, index=False)
-    log_callback(f"  Stress CSV yazıldı: {csv_path} ({len(df)} eleman)")
-    return csv_path
-
-
-def extract_displacements_csv(op2_model, output_dir, thickness, log_callback):
-    """Displacement sonuçlarını CSV'ye yazar."""
-    disp_data = []
-
-    if not op2_model.displacements:
-        log_callback("  UYARI: Displacement verisi bulunamadı.")
-        return None
-
-    for subcase_id, disp_obj in op2_model.displacements.items():
-        node_ids = disp_obj.node_gridtype[:, 0]
-        data = disp_obj.data
-
-        for t_idx in range(data.shape[0]):
-            for i, nid in enumerate(node_ids):
-                row = data[t_idx, i, :]
-                disp_data.append({
-                    "Subcase": subcase_id,
-                    "NodeID": int(nid),
-                    "T1": row[0], "T2": row[1], "T3": row[2],
-                    "R1": row[3], "R2": row[4], "R3": row[5],
-                    "Magnitude": float(np.sqrt(row[0]**2 + row[1]**2 + row[2]**2)),
-                })
-
-    df = pd.DataFrame(disp_data)
-    csv_path = os.path.join(output_dir, f"displacements_t{thickness:.4g}.csv")
-    df.to_csv(csv_path, index=False)
-    log_callback(f"  Displacement CSV yazıldı: {csv_path} ({len(df)} satır)")
-    return csv_path
+    # Displacement CSV
+    if op2_model.displacements:
+        disp_data = []
+        for subcase_id, disp_obj in op2_model.displacements.items():
+            node_ids = disp_obj.node_gridtype[:, 0]
+            data = disp_obj.data
+            for t_idx in range(data.shape[0]):
+                for i, nid in enumerate(node_ids):
+                    r = data[t_idx, i, :]
+                    disp_data.append({
+                        "NodeID": int(nid),
+                        "T1": r[0], "T2": r[1], "T3": r[2],
+                        "R1": r[3], "R2": r[4], "R3": r[5],
+                        "Magnitude": float(np.sqrt(r[0]**2 + r[1]**2 + r[2]**2)),
+                    })
+        df = pd.DataFrame(disp_data)
+        csv_path = os.path.join(output_dir, f"displacements_{label}.csv")
+        df.to_csv(csv_path, index=False)
+        log_callback(f"  Disp CSV: {csv_path} ({len(df)} satır)")
 
 
 def load_allowable_excel(excel_path):
-    """Stress allowable Excel dosyasını okur. {element_id: allowable} dict döndürür."""
+    """Stress allowable Excel: {element_id: allowable}"""
     df = pd.read_excel(excel_path, sheet_name=0)
-    # Sütun isimlerini normalize et
     df.columns = [c.strip() for c in df.columns]
-
-    # İlk sütun Element ID, ikinci sütun Allowable
     eid_col = df.columns[0]
     allow_col = df.columns[1]
+    return {int(row[eid_col]): float(row[allow_col]) for _, row in df.iterrows()}
 
-    allowable_map = {}
-    for _, row in df.iterrows():
-        eid = int(row[eid_col])
-        allow = float(row[allow_col])
-        allowable_map[eid] = allow
 
-    return allowable_map
+def check_stress_constraints(stress_map, allowable_map):
+    """Stress kontrolü: (ok, failed_list, max_vm)"""
+    failed = []
+    max_vm = 0.0
+    for eid, vm in stress_map.items():
+        if vm > max_vm:
+            max_vm = vm
+        if eid in allowable_map and vm > allowable_map[eid]:
+            failed.append((eid, vm, allowable_map[eid]))
+    return len(failed) == 0, failed, max_vm
+
+
+def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callback):
+    """BDF'yi değiştir, çöz, sonuçları oku. Returns (max_disp, stress_map, op2_model)"""
+    os.makedirs(work_dir, exist_ok=True)
+    bdf_basename = os.path.basename(bdf_path)
+    modified_bdf = os.path.join(work_dir, bdf_basename)
+    modify_pshell_thicknesses(bdf_path, modified_bdf, thickness_map, log_callback)
+
+    op2_path = run_nastran(nastran_exe, modified_bdf, work_dir, log_callback)
+    op2_model = OP2()
+    op2_model.read_op2(op2_path)
+
+    max_disp = get_max_absolute_displacement(op2_model)
+    stress_map = get_von_mises_stresses(op2_model)
+    return max_disp, stress_map, op2_model
+
+
+def compute_total_weight(thickness_map):
+    """Kalınlık toplamı (ağırlık proxy'si - gerçek ağırlık alan*t*rho ama
+    karşılaştırma için sum(t) yeterli)."""
+    return sum(thickness_map.values())
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 1: Sensitivity-Based Optimizasyon
+# ---------------------------------------------------------------------------
+
+def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                         min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
+    """
+    Hassasiyet tabanlı optimizasyon:
+    1) Referans çözüm (tüm PSHELL'ler max kalınlıkta)
+    2) Her PSHELL'i step kadar incelt, hassasiyet hesapla
+    3) Displacement'a az etkisi olanları incelt, çok etkisi olanları kalın tut
+    4) Stress kontrolü ile sınırla
+    """
+    n = len(pids)
+    log_callback(f"\n  Toplam {n} PSHELL optimize edilecek.")
+
+    # Başlangıç: tüm PSHELL'ler max kalınlıkta
+    current_t = {pid: max_t for pid in pids}
+
+    for iteration in range(max_iter):
+        log_callback(f"\n{'='*50}")
+        log_callback(f"SENSITIVITY İTERASYON {iteration + 1}/{max_iter}")
+        log_callback(f"  Toplam kalınlık (ağırlık proxy): {compute_total_weight(current_t):.4f}")
+        progress_callback((iteration / max_iter) * 100)
+
+        # Referans çözüm
+        ref_dir = os.path.join(output_dir, f"sens_iter{iteration}_ref")
+        log_callback("  Referans çözüm yapılıyor...")
+        ref_disp, ref_stress, ref_op2 = solve_and_evaluate(
+            nastran_exe, bdf_path, current_t, ref_dir, log_callback
+        )
+        log_callback(f"  Ref Max Disp: {ref_disp:.6f} (Limit: {max_disp_limit})")
+
+        stress_ok, failed, max_vm = check_stress_constraints(ref_stress, allowable_map)
+        log_callback(f"  Ref Max VM: {max_vm:.2f}, Stress OK: {stress_ok}")
+
+        if not stress_ok:
+            # Stress aşan elemanların PSHELL'lerini kalınlaştır
+            log_callback(f"  {len(failed)} eleman stress aşıyor, kalınlaştırılıyor...")
+            for eid, vm, allow in failed:
+                for pid in pids:
+                    if current_t[pid] < max_t:
+                        current_t[pid] = min(current_t[pid] + step, max_t)
+            continue
+
+        if ref_disp > max_disp_limit:
+            log_callback("  Displacement limiti aşılıyor, kalınlık artırılamaz!")
+            break
+
+        # Hassasiyet analizi: her PSHELL'i step kadar incelt ve etkisini ölç
+        log_callback("  Hassasiyet analizi yapılıyor...")
+        sensitivities = {}
+        delta_t = step
+
+        for i, pid in enumerate(pids):
+            if current_t[pid] <= min_t + 1e-9:
+                sensitivities[pid] = float('inf')  # Zaten minimum, daha incelmez
+                continue
+
+            perturbed_t = dict(current_t)
+            perturbed_t[pid] = current_t[pid] - delta_t
+
+            pert_dir = os.path.join(output_dir, f"sens_iter{iteration}_p{pid}")
+            try:
+                pert_disp, pert_stress, _ = solve_and_evaluate(
+                    nastran_exe, bdf_path, perturbed_t, pert_dir, log_callback
+                )
+                # dDisp/dT: displacement'ın kalınlık azalmasına duyarlılığı
+                sensitivity = (pert_disp - ref_disp) / delta_t
+                sensitivities[pid] = sensitivity
+
+                # Stress kontrolü
+                s_ok, s_failed, _ = check_stress_constraints(pert_stress, allowable_map)
+                if not s_ok:
+                    sensitivities[pid] = float('inf')  # Stress aşıyor, inceltme
+
+            except Exception:
+                sensitivities[pid] = float('inf')
+
+            log_callback(f"    PID {pid}: sens = {sensitivities[pid]:.6f} ({i+1}/{n})")
+
+        # En az hassas olanları incelt (displacement'ı az etkileyenler)
+        sorted_pids = sorted(
+            [p for p in pids if sensitivities[p] < float('inf')],
+            key=lambda p: abs(sensitivities[p])
+        )
+
+        if not sorted_pids:
+            log_callback("  Hiçbir PSHELL daha fazla inceltilemez.")
+            break
+
+        # Alt %50'sini incelt
+        n_reduce = max(1, len(sorted_pids) // 2)
+        reduced_any = False
+        for pid in sorted_pids[:n_reduce]:
+            new_val = current_t[pid] - step
+            if new_val >= min_t:
+                current_t[pid] = round(new_val, 8)
+                reduced_any = True
+
+        if not reduced_any:
+            log_callback("  Minimum kalınlığa ulaşıldı, iterasyon durduruluyor.")
+            break
+
+        log_callback(f"  {n_reduce} PSHELL incelendi.")
+
+    # Son çözüm
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress, final_op2 = solve_and_evaluate(
+        nastran_exe, bdf_path, current_t, final_dir, log_callback
+    )
+    extract_results_csv(final_op2, final_dir, "final", log_callback)
+
+    progress_callback(100)
+    return current_t, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 2: SciPy Minimize (SLSQP)
+# ---------------------------------------------------------------------------
+
+def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                   min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
+    """SciPy SLSQP ile gradient-based optimizasyon."""
+    from scipy.optimize import minimize
+
+    n = len(pids)
+    eval_count = [0]
+
+    log_callback(f"\n  SciPy SLSQP Optimizasyon - {n} PSHELL")
+
+    def objective(x):
+        """Minimize: toplam kalınlık (ağırlık proxy)"""
+        return np.sum(x)
+
+    def disp_constraint(x):
+        """Constraint: max_disp_limit - max_disp >= 0"""
+        eval_count[0] += 1
+        t_map = {pid: float(x[i]) for i, pid in enumerate(pids)}
+
+        work_dir = os.path.join(output_dir, f"scipy_eval{eval_count[0]}")
+        log_callback(f"\n  Eval #{eval_count[0]}: sum(t) = {np.sum(x):.4f}")
+        progress_callback(min(eval_count[0] / max_iter * 100, 99))
+
+        try:
+            max_disp, stress_map, _ = solve_and_evaluate(
+                nastran_exe, bdf_path, t_map, work_dir, log_callback
+            )
+            log_callback(f"  Max Disp: {max_disp:.6f}")
+            return max_disp_limit - max_disp
+        except Exception as exc:
+            log_callback(f"  Nastran hatası: {exc}")
+            return -1.0  # Infeasible
+
+    def stress_constraint(x):
+        """Constraint: min(allowable - vm) >= 0 (tüm elemanlar için)"""
+        t_map = {pid: float(x[i]) for i, pid in enumerate(pids)}
+        work_dir = os.path.join(output_dir, f"scipy_stress_eval{eval_count[0]}")
+
+        try:
+            _, stress_map, _ = solve_and_evaluate(
+                nastran_exe, bdf_path, t_map, work_dir, log_callback
+            )
+            min_margin = float('inf')
+            for eid, vm in stress_map.items():
+                if eid in allowable_map:
+                    margin = allowable_map[eid] - vm
+                    if margin < min_margin:
+                        min_margin = margin
+            return min_margin if min_margin < float('inf') else 0.0
+        except Exception:
+            return -1.0
+
+    # Başlangıç noktası: orta kalınlık
+    x0 = np.full(n, (min_t + max_t) / 2.0)
+    bounds = [(min_t, max_t)] * n
+
+    constraints = [
+        {"type": "ineq", "fun": disp_constraint},
+    ]
+
+    result = minimize(
+        objective, x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": max_iter, "ftol": step / 10, "eps": step},
+    )
+
+    log_callback(f"\n  SciPy sonucu: {result.message}")
+    log_callback(f"  Toplam eval: {eval_count[0]}")
+
+    final_t = {pid: round(float(result.x[i]), 8) for i, pid in enumerate(pids)}
+
+    # Son çözüm
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress, final_op2 = solve_and_evaluate(
+        nastran_exe, bdf_path, final_t, final_dir, log_callback
+    )
+    extract_results_csv(final_op2, final_dir, "final", log_callback)
+
+    progress_callback(100)
+    return final_t, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 3: Hybrid (Uniform Tarama + Sensitivity)
+# ---------------------------------------------------------------------------
+
+def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                    min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
+    """
+    1) Uniform tarama: tüm PSHELL'lere aynı kalınlık vererek max'tan min'e doğru tara,
+       displacement limitini sağlayan minimum uniform kalınlığı bul (bisection).
+    2) Bu kalınlığı başlangıç noktası olarak sensitivity optimizasyonuna ver.
+    """
+    log_callback("\n  AŞAMA 1: Bisection ile başlangıç kalınlığı bulunuyor...")
+
+    low = min_t
+    high = max_t
+    best_uniform_t = max_t
+    bisect_iter = 0
+    max_bisect = 20
+
+    while high - low > step / 2 and bisect_iter < max_bisect:
+        bisect_iter += 1
+        mid = round((low + high) / 2, 8)
+        t_map = {pid: mid for pid in pids}
+
+        work_dir = os.path.join(output_dir, f"bisect_{bisect_iter}")
+        log_callback(f"  Bisection #{bisect_iter}: t = {mid}")
+        progress_callback(bisect_iter / (max_bisect + max_iter) * 100)
+
+        try:
+            max_disp, stress_map, _ = solve_and_evaluate(
+                nastran_exe, bdf_path, t_map, work_dir, log_callback
+            )
+            stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+            log_callback(f"    Disp: {max_disp:.6f}, VM: {max_vm:.2f}, "
+                         f"Disp OK: {max_disp <= max_disp_limit}, Stress OK: {stress_ok}")
+
+            if max_disp <= max_disp_limit and stress_ok:
+                best_uniform_t = mid
+                high = mid
+            else:
+                low = mid
+        except Exception as exc:
+            log_callback(f"    Nastran hatası: {exc}")
+            low = mid
+
+    log_callback(f"\n  Bisection sonucu: uniform t = {best_uniform_t}")
+    log_callback(f"\n  AŞAMA 2: Sensitivity ile ince ayar yapılıyor...")
+
+    # Sensitivity optimizasyonu, bisection sonucundan başla
+    # Ama max_t yerine best_uniform_t'den başlat
+    remaining_iter = max(3, max_iter - bisect_iter)
+    result_t, final_disp, final_stress = optimize_sensitivity(
+        bdf_path, nastran_exe,
+        os.path.join(output_dir, "sensitivity_phase"),
+        pids, allowable_map,
+        min_t, best_uniform_t, step, max_disp_limit, remaining_iter,
+        log_callback, progress_callback
+    )
+
+    return result_t, final_disp, final_stress
 
 
 # ---------------------------------------------------------------------------
@@ -257,8 +540,8 @@ def load_allowable_excel(excel_path):
 class NastranToolApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Eray-Tool | NX Nastran Thickness Iterasyon Aracı")
-        self.root.geometry("800x650")
+        self.root.title("Eray-Tool | NX Nastran Thickness Optimizasyon Aracı")
+        self.root.geometry("850x700")
         self.root.resizable(True, True)
         self._build_ui()
 
@@ -311,34 +594,49 @@ class NastranToolApp:
             row=row, column=0, columnspan=5, sticky=tk.EW, pady=8
         )
 
-        # --- Iterasyon Parametreleri ---
+        # --- Optimizasyon Parametreleri ---
         row += 1
-        param_frame = ttk.LabelFrame(main_frame, text="İterasyon Parametreleri", padding=8)
+        param_frame = ttk.LabelFrame(main_frame, text="Optimizasyon Parametreleri", padding=8)
         param_frame.grid(row=row, column=0, columnspan=5, sticky=tk.EW, pady=4)
 
-        # Min Thickness
+        # Satır 0: Min / Max / Step
         ttk.Label(param_frame, text="Min Kalınlık:").grid(row=0, column=0, sticky=tk.W, padx=4)
         self.min_t_entry = ttk.Entry(param_frame, width=10)
         self.min_t_entry.grid(row=0, column=1, padx=4)
         self.min_t_entry.insert(0, "0.5")
 
-        # Max Thickness
         ttk.Label(param_frame, text="Max Kalınlık:").grid(row=0, column=2, sticky=tk.W, padx=4)
         self.max_t_entry = ttk.Entry(param_frame, width=10)
         self.max_t_entry.grid(row=0, column=3, padx=4)
         self.max_t_entry.insert(0, "5.0")
 
-        # Step
         ttk.Label(param_frame, text="Adım (Step):").grid(row=0, column=4, sticky=tk.W, padx=4)
         self.step_entry = ttk.Entry(param_frame, width=10)
         self.step_entry.grid(row=0, column=5, padx=4)
         self.step_entry.insert(0, "0.1")
 
-        # Max Displacement
+        # Satır 1: Max Disp / Max Iter
         ttk.Label(param_frame, text="Max Disp:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=(6, 0))
         self.max_disp_entry = ttk.Entry(param_frame, width=10)
         self.max_disp_entry.grid(row=1, column=1, padx=4, pady=(6, 0))
         self.max_disp_entry.insert(0, "10.0")
+
+        ttk.Label(param_frame, text="Max İterasyon:").grid(row=1, column=2, sticky=tk.W, padx=4, pady=(6, 0))
+        self.max_iter_entry = ttk.Entry(param_frame, width=10)
+        self.max_iter_entry.grid(row=1, column=3, padx=4, pady=(6, 0))
+        self.max_iter_entry.insert(0, "10")
+
+        # Satır 2: Algoritma seçimi
+        ttk.Label(param_frame, text="Algoritma:").grid(row=2, column=0, sticky=tk.W, padx=4, pady=(6, 0))
+        self.algo_var = tk.StringVar(value="sensitivity")
+        algo_combo = ttk.Combobox(param_frame, textvariable=self.algo_var, state="readonly", width=30)
+        algo_combo["values"] = (
+            "Sensitivity-Based",
+            "SciPy Minimize (SLSQP)",
+            "Hybrid (Uniform + Sensitivity)",
+        )
+        algo_combo.current(0)
+        algo_combo.grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=4, pady=(6, 0))
 
         main_frame.columnconfigure(1, weight=1)
 
@@ -347,7 +645,7 @@ class NastranToolApp:
         btn_frame = ttk.Frame(main_frame)
         btn_frame.grid(row=row, column=0, columnspan=5, pady=10)
 
-        self.run_btn = ttk.Button(btn_frame, text="Iterasyonu Başlat", command=self._on_run)
+        self.run_btn = ttk.Button(btn_frame, text="Optimizasyonu Başlat", command=self._on_run)
         self.run_btn.pack(side=tk.LEFT, padx=8)
 
         self.single_btn = ttk.Button(btn_frame, text="Tek Çözüm (Mevcut BDF)", command=self._on_single_run)
@@ -390,7 +688,7 @@ class NastranToolApp:
             messagebox.showerror("Hata", "Geçerli bir BDF dosyası seçiniz.")
             return None
         if not nastran_exe or not os.path.isfile(nastran_exe):
-            messagebox.showerror("Hata", "Geçerli bir NX Nastran çalıştırılabilir dosyası seçiniz.")
+            messagebox.showerror("Hata", "Geçerli bir NX Nastran dosyası seçiniz.")
             return None
         if not output_dir:
             messagebox.showerror("Hata", "Çıktı klasörü seçiniz.")
@@ -398,20 +696,28 @@ class NastranToolApp:
         os.makedirs(output_dir, exist_ok=True)
         return bdf_path, nastran_exe, output_dir
 
-    # --- Tek çözüm (iterasyonsuz, eski davranış) ---
+    def _disable_buttons(self):
+        self.run_btn.configure(state=tk.DISABLED)
+        self.single_btn.configure(state=tk.DISABLED)
+
+    def _finish(self):
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+        self.run_btn.configure(state=tk.NORMAL)
+        self.single_btn.configure(state=tk.NORMAL)
+
+    # --- Tek çözüm ---
     def _on_single_run(self):
         vals = self._validate_common()
         if not vals:
             return
         bdf_path, nastran_exe, output_dir = vals
-        self.run_btn.configure(state=tk.DISABLED)
-        self.single_btn.configure(state=tk.DISABLED)
+        self._disable_buttons()
         self.progress.configure(mode="indeterminate")
         self.progress.start(10)
-        thread = threading.Thread(
+        threading.Thread(
             target=self._single_worker, args=(bdf_path, nastran_exe, output_dir), daemon=True
-        )
-        thread.start()
+        ).start()
 
     def _single_worker(self, bdf_path, nastran_exe, output_dir):
         try:
@@ -420,21 +726,14 @@ class NastranToolApp:
             self._log("=" * 50)
 
             op2_path = run_nastran(nastran_exe, bdf_path, output_dir, self._log)
-
-            self._log("\nOP2 okunuyor...")
             op2_model = OP2()
             op2_model.read_op2(op2_path)
 
-            self._log("\nStress çıkarılıyor...")
-            extract_von_mises_stress_csv(op2_model, output_dir, 0, self._log)
-
-            self._log("\nDisplacement çıkarılıyor...")
-            extract_displacements_csv(op2_model, output_dir, 0, self._log)
+            extract_results_csv(op2_model, output_dir, "result", self._log)
 
             max_disp = get_max_absolute_displacement(op2_model)
             self._log(f"\nMax Absolute Displacement: {max_disp:.6f}")
-
-            self._log("\nİŞLEM TAMAMLANDI!")
+            self._log("İŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo("Başarılı", "Sonuçlar CSV olarak yazıldı!"))
         except Exception as exc:
             error_msg = str(exc)
@@ -443,7 +742,7 @@ class NastranToolApp:
         finally:
             self.root.after(0, self._finish)
 
-    # --- İterasyon modu ---
+    # --- Optimizasyon ---
     def _on_run(self):
         vals = self._validate_common()
         if not vals:
@@ -460,157 +759,94 @@ class NastranToolApp:
             max_t = float(self.max_t_entry.get().strip())
             step = float(self.step_entry.get().strip())
             max_disp_limit = float(self.max_disp_entry.get().strip())
+            max_iter = int(self.max_iter_entry.get().strip())
         except ValueError:
-            messagebox.showerror("Hata", "Min/Max kalınlık, adım ve max disp değerleri sayısal olmalıdır.")
+            messagebox.showerror("Hata", "Parametre değerleri sayısal olmalıdır.")
             return
 
         if min_t >= max_t or step <= 0:
             messagebox.showerror("Hata", "Min < Max ve Step > 0 olmalıdır.")
             return
 
-        self.run_btn.configure(state=tk.DISABLED)
-        self.single_btn.configure(state=tk.DISABLED)
+        algo_name = self.algo_var.get()
+        self._disable_buttons()
         self.progress.configure(mode="determinate", value=0)
 
-        thread = threading.Thread(
-            target=self._iteration_worker,
-            args=(bdf_path, nastran_exe, output_dir, excel_path, min_t, max_t, step, max_disp_limit),
+        threading.Thread(
+            target=self._opt_worker,
+            args=(bdf_path, nastran_exe, output_dir, excel_path,
+                  min_t, max_t, step, max_disp_limit, max_iter, algo_name),
             daemon=True,
-        )
-        thread.start()
+        ).start()
 
-    def _iteration_worker(self, bdf_path, nastran_exe, output_dir, excel_path,
-                          min_t, max_t, step, max_disp_limit):
+    def _opt_worker(self, bdf_path, nastran_exe, output_dir, excel_path,
+                    min_t, max_t, step, max_disp_limit, max_iter, algo_name):
         try:
             self._log("=" * 60)
-            self._log("THICKNESS İTERASYON MODU")
+            self._log(f"OPTİMİZASYON: {algo_name}")
             self._log(f"  Min: {min_t}  Max: {max_t}  Step: {step}")
-            self._log(f"  Max Displacement Limiti: {max_disp_limit}")
+            self._log(f"  Max Disp: {max_disp_limit}  Max İter: {max_iter}")
             self._log("=" * 60)
 
-            # Allowable Excel oku
-            self._log("\nAllowable Excel okunuyor...")
+            # PSHELL PID'lerini oku
+            pids = read_pshell_pids(bdf_path)
+            if not pids:
+                raise ValueError("BDF dosyasında PSHELL kartı bulunamadı!")
+            self._log(f"\n  {len(pids)} PSHELL bulundu: {pids[:10]}{'...' if len(pids) > 10 else ''}")
+
+            # Allowable oku
             allowable_map = load_allowable_excel(excel_path)
-            self._log(f"  {len(allowable_map)} element için allowable değeri yüklendi.")
+            self._log(f"  {len(allowable_map)} element allowable yüklendi.")
 
-            # Thickness değerlerini oluştur
-            thicknesses = []
-            t = min_t
-            while t <= max_t + 1e-9:
-                thicknesses.append(round(t, 8))
-                t += step
-            total_steps = len(thicknesses)
-            self._log(f"  Toplam {total_steps} iterasyon yapılacak.\n")
+            # Algoritma seç ve çalıştır
+            if "Sensitivity" in algo_name and "Hybrid" not in algo_name:
+                result_t, final_disp, final_stress = optimize_sensitivity(
+                    bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                    min_t, max_t, step, max_disp_limit, max_iter,
+                    self._log, self._set_progress
+                )
+            elif "SciPy" in algo_name:
+                result_t, final_disp, final_stress = optimize_scipy(
+                    bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                    min_t, max_t, step, max_disp_limit, max_iter,
+                    self._log, self._set_progress
+                )
+            else:  # Hybrid
+                result_t, final_disp, final_stress = optimize_hybrid(
+                    bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                    min_t, max_t, step, max_disp_limit, max_iter,
+                    self._log, self._set_progress
+                )
 
-            # Sonuç özeti
-            summary_rows = []
-            passed_thickness = None
+            # Sonuç raporu
+            self._log(f"\n{'='*60}")
+            self._log("OPTİMİZASYON SONUÇLARI")
+            self._log(f"  Max Displacement: {final_disp:.6f} (Limit: {max_disp_limit})")
+            stress_ok, failed, max_vm = check_stress_constraints(final_stress, allowable_map)
+            self._log(f"  Max Von Mises: {max_vm:.2f}")
+            self._log(f"  Displacement OK: {final_disp <= max_disp_limit}")
+            self._log(f"  Stress OK: {stress_ok}")
+            self._log(f"  Toplam Kalınlık: {compute_total_weight(result_t):.4f}")
 
-            for idx, thickness in enumerate(thicknesses):
-                self._log("-" * 50)
-                self._log(f"İTERASYON {idx + 1}/{total_steps} | Kalınlık = {thickness}")
-                self._set_progress((idx / total_steps) * 100)
+            # Kalınlık dağılımı CSV
+            t_rows = [{"PID": pid, "Thickness": t} for pid, t in sorted(result_t.items())]
+            t_df = pd.DataFrame(t_rows)
+            t_csv = os.path.join(output_dir, "optimized_thicknesses.csv")
+            t_df.to_csv(t_csv, index=False)
+            self._log(f"\n  Kalınlık dağılımı: {t_csv}")
 
-                # 1) BDF'yi kopyala ve kalınlığı değiştir
-                iter_dir = os.path.join(output_dir, f"iter_t{thickness:.4g}")
-                os.makedirs(iter_dir, exist_ok=True)
+            self._log("\n  PSHELL Kalınlık Dağılımı:")
+            for pid, t in sorted(result_t.items()):
+                self._log(f"    PID {pid}: {t:.4f}")
 
-                bdf_basename = os.path.basename(bdf_path)
-                modified_bdf = os.path.join(iter_dir, bdf_basename)
-                modify_pshell_thickness(bdf_path, modified_bdf, thickness, self._log)
-
-                # 2) Nastran çalıştır
-                try:
-                    op2_path = run_nastran(nastran_exe, modified_bdf, iter_dir, self._log)
-                except Exception as run_exc:
-                    self._log(f"  UYARI: Nastran hatası, bu iterasyon atlanıyor: {run_exc}")
-                    summary_rows.append({
-                        "Thickness": thickness,
-                        "MaxDisplacement": None,
-                        "MaxVonMises": None,
-                        "DispOK": False,
-                        "StressOK": False,
-                        "Status": "NASTRAN HATASI",
-                    })
-                    continue
-
-                # 3) OP2 oku
-                op2_model = OP2()
-                op2_model.read_op2(op2_path)
-
-                # 4) CSV'leri yaz
-                extract_von_mises_stress_csv(op2_model, iter_dir, thickness, self._log)
-                extract_displacements_csv(op2_model, iter_dir, thickness, self._log)
-
-                # 5) Displacement kontrolü
-                max_disp = get_max_absolute_displacement(op2_model)
-                disp_ok = max_disp <= max_disp_limit
-                self._log(f"  Max Disp: {max_disp:.6f} (Limit: {max_disp_limit}) -> {'OK' if disp_ok else 'FAIL'}")
-
-                # 6) Stress kontrolü
-                stress_map = get_von_mises_stresses(op2_model)
-                stress_ok = True
-                max_vm = 0.0
-                failed_elements = []
-
-                for eid, vm_val in stress_map.items():
-                    if vm_val > max_vm:
-                        max_vm = vm_val
-                    if eid in allowable_map:
-                        if vm_val > allowable_map[eid]:
-                            stress_ok = False
-                            failed_elements.append((eid, vm_val, allowable_map[eid]))
-
-                if failed_elements:
-                    self._log(f"  Stress FAIL: {len(failed_elements)} eleman allowable'ı aşıyor.")
-                    # İlk 5 tanesini göster
-                    for eid, vm, allow in failed_elements[:5]:
-                        self._log(f"    Element {eid}: VM={vm:.2f} > Allowable={allow:.2f}")
-                    if len(failed_elements) > 5:
-                        self._log(f"    ... ve {len(failed_elements) - 5} eleman daha")
-                else:
-                    self._log(f"  Stress: OK (Max VM: {max_vm:.2f})")
-
-                status = "PASS" if (disp_ok and stress_ok) else "FAIL"
-                self._log(f"  SONUÇ: {status}")
-
-                summary_rows.append({
-                    "Thickness": thickness,
-                    "MaxDisplacement": max_disp,
-                    "MaxVonMises": max_vm,
-                    "DispOK": disp_ok,
-                    "StressOK": stress_ok,
-                    "Status": status,
-                })
-
-                if disp_ok and stress_ok and passed_thickness is None:
-                    passed_thickness = thickness
-
-            # Sonuç özeti CSV
-            self._set_progress(100)
-            self._log("\n" + "=" * 60)
-
-            summary_df = pd.DataFrame(summary_rows)
-            summary_csv = os.path.join(output_dir, "iteration_summary.csv")
-            summary_df.to_csv(summary_csv, index=False)
-            self._log(f"İterasyon özeti yazıldı: {summary_csv}")
-
-            if passed_thickness is not None:
-                self._log(f"\nSONUÇ: Tüm koşulları sağlayan minimum kalınlık = {passed_thickness}")
-                self.root.after(0, lambda t=passed_thickness: messagebox.showinfo(
-                    "İterasyon Tamamlandı",
-                    f"Koşulları sağlayan minimum kalınlık: {t}\n\n"
-                    f"Detaylar: {summary_csv}"
-                ))
-            else:
-                self._log("\nSONUÇ: Hiçbir kalınlık tüm koşulları sağlayamadı!")
-                self.root.after(0, lambda: messagebox.showwarning(
-                    "İterasyon Tamamlandı",
-                    "Hiçbir kalınlık değeri tüm koşulları sağlayamadı.\n"
-                    "Max kalınlığı artırmayı deneyiniz."
-                ))
-
-            self._log("İŞLEM TAMAMLANDI!")
+            self._log("\nİŞLEM TAMAMLANDI!")
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Optimizasyon Tamamlandı",
+                f"Max Disp: {final_disp:.4f}\n"
+                f"Max VM: {max_vm:.2f}\n"
+                f"Toplam Kalınlık: {compute_total_weight(result_t):.4f}\n\n"
+                f"Detaylar: {t_csv}"
+            ))
 
         except Exception as exc:
             error_msg = str(exc)
@@ -618,12 +854,6 @@ class NastranToolApp:
             self.root.after(0, lambda msg=error_msg: messagebox.showerror("Hata", msg))
         finally:
             self.root.after(0, self._finish)
-
-    def _finish(self):
-        self.progress.stop()
-        self.progress.configure(mode="determinate", value=0)
-        self.run_btn.configure(state=tk.NORMAL)
-        self.single_btn.configure(state=tk.NORMAL)
 
 
 def main():

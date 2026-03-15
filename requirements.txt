@@ -1,3 +1,4 @@
 pyNastran>=1.4.0
 numpy
 pandas
+openpyxl

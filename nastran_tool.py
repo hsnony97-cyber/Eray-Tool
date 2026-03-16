@@ -5,10 +5,10 @@ BDF dosyasındaki PSHELL'lerin kalınlıklarını bağımsız olarak optimize ed
 Amaç: Minimum ağırlık ile displacement ve stress sınırlarını sağlamak.
 
 Algoritmalar:
-  1) Sensitivity-Based: Hassasiyet analizi ile optimize eder
-  2) SciPy Minimize: SLSQP gradient-based optimizasyon
-  3) Hybrid: Bisection + sensitivity ince ayar
-  4) DOE + Surrogate: Latin Hypercube ile deney tasarımı, surrogate model ile hızlı yakınsama
+  1) Sensitivity-Based
+  2) SciPy Minimize (SLSQP)
+  3) Hybrid (Bisection + Sensitivity)
+  4) DOE + Surrogate Model
 """
 
 import os
@@ -19,7 +19,12 @@ import threading
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from pyNastran.op2.op2 import OP2
+from pyNastran.bdf.bdf import BDF
 
 
 # ---------------------------------------------------------------------------
@@ -48,32 +53,75 @@ def format_nastran_real(value):
     return s
 
 
-def log_thickness_table(thickness_map, max_disp, max_disp_limit, max_vm, stress_ok, log_callback):
-    """Her iterasyondan sonra kalınlık tablosunu ve displacement bilgisini ekrana yazdırır."""
-    log_callback("")
-    log_callback("  ┌─────────┬────────────┐")
-    log_callback("  │   PID   │  Kalınlık  │")
-    log_callback("  ├─────────┼────────────┤")
-    for pid in sorted(thickness_map.keys()):
-        t = thickness_map[pid]
-        log_callback(f"  │ {pid:>7} │ {t:>10.4f} │")
-    log_callback("  └─────────┴────────────┘")
-    total_t = sum(thickness_map.values())
-    log_callback(f"  Toplam Kalınlık (Ağırlık Proxy): {total_t:.4f}")
+# ---------------------------------------------------------------------------
+# BDF okuma: PSHELL, malzeme density, eleman alanları
+# ---------------------------------------------------------------------------
 
-    disp_status = "OK" if max_disp <= max_disp_limit else "FAIL"
-    stress_status = "OK" if stress_ok else "FAIL"
-    log_callback(f"  Max Displacement: {max_disp:.6f} / {max_disp_limit} [{disp_status}]")
-    log_callback(f"  Max Von Mises:    {max_vm:.2f} [Stress: {stress_status}]")
-    log_callback("")
+def read_bdf_model(bdf_path):
+    """pyNastran ile BDF'yi okur ve PSHELL bilgilerini çıkarır.
+    Returns:
+        pids: PSHELL PID listesi
+        pid_mid_map: {pid: mid} PSHELL -> malzeme eşlemesi
+        mid_density_map: {mid: rho} malzeme density
+        pid_area_map: {pid: total_area} her PSHELL'e ait elemanların toplam alanı
+    """
+    model = BDF()
+    model.read_bdf(bdf_path, xref=True)
+
+    pids = []
+    pid_mid_map = {}
+    mid_density_map = {}
+    pid_area_map = {}
+
+    # PSHELL kartlarını oku
+    for pid, prop in model.properties.items():
+        if prop.type == "PSHELL":
+            pids.append(pid)
+            mid = prop.mid1_ref.mid if hasattr(prop, "mid1_ref") and prop.mid1_ref else prop.Mid1()
+            pid_mid_map[pid] = mid
+
+    # MAT1 density değerlerini oku
+    for mid, mat in model.materials.items():
+        if hasattr(mat, "rho"):
+            mid_density_map[mid] = mat.rho
+
+    # Her PID'e ait elemanların toplam alanını hesapla
+    for pid in pids:
+        pid_area_map[pid] = 0.0
+
+    for eid, elem in model.elements.items():
+        if elem.type in ("CQUAD4", "CTRIA3", "CQUAD8", "CTRIA6"):
+            elem_pid = elem.pid
+            if elem_pid in pid_area_map:
+                try:
+                    area = elem.Area()
+                    pid_area_map[elem_pid] += area
+                except Exception:
+                    pass
+
+    return pids, pid_mid_map, mid_density_map, pid_area_map
+
+
+def compute_real_mass(thickness_map, pid_mid_map, mid_density_map, pid_area_map):
+    """Gerçek kütle hesabı: mass = sum(thickness * area * density) for each PID"""
+    total_mass = 0.0
+    pid_mass = {}
+    for pid, t in thickness_map.items():
+        area = pid_area_map.get(pid, 0.0)
+        mid = pid_mid_map.get(pid)
+        rho = mid_density_map.get(mid, 0.0) if mid else 0.0
+        m = t * area * rho
+        pid_mass[pid] = m
+        total_mass += m
+    return total_mass, pid_mass
 
 
 # ---------------------------------------------------------------------------
-# BDF PSHELL okuma / yazma
+# BDF PSHELL yazma (pyNastran kullanmadan, hızlı text işlemi)
 # ---------------------------------------------------------------------------
 
 def read_pshell_pids(bdf_path):
-    """BDF dosyasından PSHELL PID listesini okur."""
+    """BDF dosyasından PSHELL PID listesini okur (hızlı text tarama)."""
     pids = []
     with open(bdf_path, "r") as f:
         for line in f:
@@ -165,7 +213,6 @@ def run_nastran(nastran_exe, bdf_path, output_dir, log_callback):
 # ---------------------------------------------------------------------------
 
 def get_von_mises_stresses(op2_model):
-    """OP2'den element bazlı max Von Mises: {eid: max_vm}"""
     stress_map = {}
     for attr_name in ("cquad4_stress", "ctria3_stress"):
         stress_dict = getattr(op2_model, attr_name, None)
@@ -253,8 +300,23 @@ def check_stress_constraints(stress_map, allowable_map):
     return len(failed) == 0, failed, max_vm
 
 
+def log_mass_summary(total_mass, max_disp, max_disp_limit, max_vm, stress_ok, log_callback):
+    """Mass Summary: toplam mass, max displacement, max stress"""
+    disp_status = "OK" if max_disp <= max_disp_limit else "FAIL"
+    stress_status = "OK" if stress_ok else "FAIL"
+    log_callback("")
+    log_callback("  ╔══════════════════════════════════════════╗")
+    log_callback("  ║           MASS SUMMARY                   ║")
+    log_callback("  ╠══════════════════════════════════════════╣")
+    log_callback(f"  ║  Total Mass:        {total_mass:>12.4f}  kg     ║")
+    log_callback(f"  ║  Max Displacement:  {max_disp:>12.6f}  [{disp_status:>4}] ║")
+    log_callback(f"  ║  Max Von Mises:     {max_vm:>12.2f}  [{stress_status:>4}] ║")
+    log_callback("  ╚══════════════════════════════════════════╝")
+    log_callback("")
+
+
 def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callback):
-    """BDF'yi değiştir, çöz, sonuçları oku ve her iterasyonda CSV yaz."""
+    """BDF'yi değiştir, çöz, sonuçları oku ve CSV yaz."""
     os.makedirs(work_dir, exist_ok=True)
     bdf_basename = os.path.basename(bdf_path)
     modified_bdf = os.path.join(work_dir, bdf_basename)
@@ -267,15 +329,50 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
     max_disp = get_max_absolute_displacement(op2_model)
     stress_map = get_von_mises_stresses(op2_model)
 
-    # Her iterasyonda stress ve displacement CSV'lerini yaz
     iter_label = os.path.basename(work_dir)
     extract_results_csv(op2_model, work_dir, iter_label, log_callback)
 
     return max_disp, stress_map, op2_model
 
 
-def compute_total_weight(thickness_map):
-    return sum(thickness_map.values())
+# ---------------------------------------------------------------------------
+# İterasyon Tracker (grafik + mass summary için)
+# ---------------------------------------------------------------------------
+
+class IterationTracker:
+    """Her iterasyonun mass, displacement, stress bilgisini tutar ve grafiğe çizer."""
+
+    def __init__(self, pid_mid_map, mid_density_map, pid_area_map,
+                 max_disp_limit, plot_callback):
+        self.pid_mid_map = pid_mid_map
+        self.mid_density_map = mid_density_map
+        self.pid_area_map = pid_area_map
+        self.max_disp_limit = max_disp_limit
+        self.plot_callback = plot_callback
+
+        self.iterations = []
+        self.masses = []
+        self.displacements = []
+        self.stresses = []
+
+    def record(self, iteration_label, thickness_map, max_disp, max_vm, stress_ok,
+               allowable_map, log_callback):
+        """Bir iterasyonu kaydet, mass summary bas, grafiği güncelle."""
+        total_mass, _ = compute_real_mass(
+            thickness_map, self.pid_mid_map, self.mid_density_map, self.pid_area_map
+        )
+
+        self.iterations.append(len(self.iterations) + 1)
+        self.masses.append(total_mass)
+        self.displacements.append(max_disp)
+        self.stresses.append(max_vm)
+
+        log_mass_summary(total_mass, max_disp, self.max_disp_limit, max_vm, stress_ok, log_callback)
+
+        # Grafiği güncelle
+        self.plot_callback(self.iterations, self.masses, self.displacements, self.max_disp_limit)
+
+        return total_mass
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +380,8 @@ def compute_total_weight(thickness_map):
 # ---------------------------------------------------------------------------
 
 def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                         min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
+                         min_t, max_t, step, max_disp_limit, max_iter,
+                         log_callback, progress_callback, tracker):
     n = len(pids)
     log_callback(f"\n  Toplam {n} PSHELL optimize edilecek.")
     current_t = {pid: max_t for pid in pids}
@@ -300,7 +398,8 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         )
 
         stress_ok, failed, max_vm = check_stress_constraints(ref_stress, allowable_map)
-        log_thickness_table(current_t, ref_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+        tracker.record(f"Sens_{iteration}", current_t, ref_disp, max_vm, stress_ok,
+                       allowable_map, log_callback)
 
         if not stress_ok:
             log_callback(f"  {len(failed)} eleman stress aşıyor, kalınlaştırılıyor...")
@@ -314,7 +413,6 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             log_callback("  Displacement limiti aşılıyor!")
             break
 
-        # Hassasiyet analizi
         log_callback("  Hassasiyet analizi yapılıyor...")
         sensitivities = {}
 
@@ -365,7 +463,6 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
         log_callback(f"  {n_reduce} PSHELL incelendi.")
 
-    # Son çözüm
     log_callback(f"\n{'='*50}")
     log_callback("SON ÇÖZÜM")
     final_dir = os.path.join(output_dir, "final_result")
@@ -374,7 +471,7 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     )
     extract_results_csv(final_op2, final_dir, "final", log_callback)
     stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
-    log_thickness_table(current_t, final_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+    tracker.record("Final", current_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
 
     progress_callback(100)
     return current_t, final_disp, final_stress
@@ -385,7 +482,8 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 # ---------------------------------------------------------------------------
 
 def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                   min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
+                   min_t, max_t, step, max_disp_limit, max_iter,
+                   log_callback, progress_callback, tracker):
     from scipy.optimize import minimize
 
     n = len(pids)
@@ -407,7 +505,8 @@ def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 nastran_exe, bdf_path, t_map, work_dir, log_callback
             )
             stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
-            log_thickness_table(t_map, max_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+            tracker.record(f"SciPy_{eval_count[0]}", t_map, max_disp, max_vm, stress_ok,
+                           allowable_map, log_callback)
             return max_disp_limit - max_disp
         except Exception as exc:
             log_callback(f"  Nastran hatası: {exc}")
@@ -431,18 +530,19 @@ def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     )
     extract_results_csv(final_op2, final_dir, "final", log_callback)
     stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
-    log_thickness_table(final_t, final_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+    tracker.record("Final", final_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
 
     progress_callback(100)
     return final_t, final_disp, final_stress
 
 
 # ---------------------------------------------------------------------------
-# ALGORİTMA 3: Hybrid (Bisection + Sensitivity)
+# ALGORİTMA 3: Hybrid
 # ---------------------------------------------------------------------------
 
 def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                    min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
+                    min_t, max_t, step, max_disp_limit, max_iter,
+                    log_callback, progress_callback, tracker):
     log_callback("\n  AŞAMA 1: Bisection ile başlangıç kalınlığı...")
 
     low, high = min_t, max_t
@@ -464,7 +564,8 @@ def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 nastran_exe, bdf_path, t_map, work_dir, log_callback
             )
             stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
-            log_thickness_table(t_map, max_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+            tracker.record(f"Bisect_{bisect_iter}", t_map, max_disp, max_vm, stress_ok,
+                           allowable_map, log_callback)
 
             if max_disp <= max_disp_limit and stress_ok:
                 best_uniform_t = mid
@@ -482,7 +583,7 @@ def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     return optimize_sensitivity(
         bdf_path, nastran_exe, os.path.join(output_dir, "sensitivity_phase"),
         pids, allowable_map, min_t, best_uniform_t, step, max_disp_limit, remaining_iter,
-        log_callback, progress_callback
+        log_callback, progress_callback, tracker
     )
 
 
@@ -491,33 +592,19 @@ def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 # ---------------------------------------------------------------------------
 
 def latin_hypercube_sampling(n_samples, n_vars, min_vals, max_vals, seed=42):
-    """Latin Hypercube Sampling ile deney noktaları üretir."""
     rng = np.random.RandomState(seed)
     result = np.zeros((n_samples, n_vars))
-
     for j in range(n_vars):
-        # Her değişken için n_samples aralığa böl, her aralıktan bir nokta seç
         cut = np.linspace(0, 1, n_samples + 1)
         uniform_samples = rng.uniform(low=cut[:-1], high=cut[1:])
         rng.shuffle(uniform_samples)
         result[:, j] = min_vals[j] + uniform_samples * (max_vals[j] - min_vals[j])
-
     return result
 
 
 def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                           min_t, max_t, step, max_disp_limit, max_iter, log_callback, progress_callback):
-    """
-    DOE (Design of Experiments) + Surrogate Model optimizasyonu:
-
-    1) Latin Hypercube Sampling ile rastgele thickness kombinasyonları üret
-    2) Her birini Nastran'da çöz
-    3) Sonuçlardan bir surrogate model (linear regression) oluştur:
-       displacement = f(t1, t2, ..., tn)
-    4) Surrogate model ile optimal noktayı bul
-    5) Gerçek Nastran ile doğrula
-    6) Doğrulama sonucunu ekleyerek modeli güncelle, tekrarla
-    """
+                           min_t, max_t, step, max_disp_limit, max_iter,
+                           log_callback, progress_callback, tracker):
     from sklearn.linear_model import Ridge
     from sklearn.preprocessing import PolynomialFeatures
     from scipy.optimize import minimize
@@ -525,22 +612,16 @@ def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_ma
     n_vars = len(pids)
     min_vals = np.full(n_vars, min_t)
     max_vals = np.full(n_vars, max_t)
-
-    # DOE numune sayısı: en az 2*n_vars+1, en fazla max_iter'in yarısı
     n_doe_samples = min(max(2 * n_vars + 1, 10), max(max_iter // 2, 5))
 
-    log_callback(f"\n  DOE + Surrogate Model Optimizasyon")
+    log_callback(f"\n  DOE + Surrogate Model")
     log_callback(f"  {n_vars} PSHELL, {n_doe_samples} DOE numune")
-    log_callback(f"\n  AŞAMA 1: Latin Hypercube Sampling ile deney tasarımı...")
+    log_callback(f"\n  AŞAMA 1: Latin Hypercube Sampling...")
 
-    # LHS ile numune üret
     samples = latin_hypercube_sampling(n_doe_samples, n_vars, min_vals, max_vals)
 
-    # Her numune için Nastran çöz
     X_train = []
     y_disp = []
-    y_weight = []
-    y_stress_ok = []
 
     for i in range(n_doe_samples):
         t_map = {pid: round(float(samples[i, j]), 8) for j, pid in enumerate(pids)}
@@ -553,12 +634,11 @@ def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_ma
                 nastran_exe, bdf_path, t_map, work_dir, log_callback
             )
             stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
-            log_thickness_table(t_map, max_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+            tracker.record(f"DOE_{i+1}", t_map, max_disp, max_vm, stress_ok,
+                           allowable_map, log_callback)
 
             X_train.append(samples[i])
             y_disp.append(max_disp)
-            y_weight.append(compute_total_weight(t_map))
-            y_stress_ok.append(1.0 if stress_ok else 0.0)
         except Exception as exc:
             log_callback(f"    Nastran hatası: {exc}")
 
@@ -567,26 +647,20 @@ def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_ma
 
     X_train = np.array(X_train)
     y_disp = np.array(y_disp)
-    y_weight = np.array(y_weight)
 
-    # DOE sonuçlarını CSV'ye kaydet
+    # DOE CSV
     doe_rows = []
     for i in range(len(X_train)):
-        row = {"Sample": i + 1, "MaxDisp": y_disp[i], "TotalWeight": y_weight[i]}
+        row = {"Sample": i + 1, "MaxDisp": y_disp[i]}
         for j, pid in enumerate(pids):
             row[f"PID_{pid}"] = X_train[i, j]
         doe_rows.append(row)
-    doe_df = pd.DataFrame(doe_rows)
-    doe_csv = os.path.join(output_dir, "doe_samples.csv")
-    doe_df.to_csv(doe_csv, index=False)
-    log_callback(f"\n  DOE sonuçları: {doe_csv}")
+    pd.DataFrame(doe_rows).to_csv(os.path.join(output_dir, "doe_samples.csv"), index=False)
 
-    # AŞAMA 2: Surrogate model oluştur ve iteratif olarak iyileştir
+    # AŞAMA 2: Surrogate
     log_callback(f"\n  AŞAMA 2: Surrogate model ile optimizasyon...")
-
     remaining_iter = max_iter - n_doe_samples
     best_t = None
-    best_disp = float('inf')
     best_weight = float('inf')
 
     for surr_iter in range(max(remaining_iter, 3)):
@@ -594,84 +668,62 @@ def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_ma
         log_callback(f"SURROGATE İTERASYON {surr_iter + 1}")
         progress_callback(40 + (surr_iter / max(remaining_iter, 3)) * 50)
 
-        # Polynomial features ile surrogate model (2. derece)
-        # n_vars büyükse sadece 1. derece kullan (hafıza tasarrufu)
         degree = 1 if n_vars > 20 else 2
         poly = PolynomialFeatures(degree=degree, include_bias=True)
         X_poly = poly.fit_transform(X_train)
 
         model = Ridge(alpha=1.0)
         model.fit(X_poly, y_disp)
+        log_callback(f"  Surrogate R²: {model.score(X_poly, y_disp):.4f}")
 
-        train_r2 = model.score(X_poly, y_disp)
-        log_callback(f"  Surrogate R²: {train_r2:.4f} ({len(X_train)} veri noktası)")
-
-        # Surrogate model ile optimize et:
-        # minimize sum(t) subject to predicted_disp <= max_disp_limit
         def surrogate_objective(x):
             return np.sum(x)
 
         def surrogate_disp_constraint(x):
             x_poly = poly.transform(x.reshape(1, -1))
-            predicted_disp = model.predict(x_poly)[0]
-            return max_disp_limit - predicted_disp
-
-        bounds = [(min_t, max_t)] * n_vars
-        x0 = np.mean(X_train, axis=0)
+            return max_disp_limit - model.predict(x_poly)[0]
 
         opt_result = minimize(
-            surrogate_objective, x0, method="SLSQP",
-            bounds=bounds,
+            surrogate_objective, np.mean(X_train, axis=0), method="SLSQP",
+            bounds=[(min_t, max_t)] * n_vars,
             constraints=[{"type": "ineq", "fun": surrogate_disp_constraint}],
             options={"maxiter": 200},
         )
 
         candidate_t = {pid: round(float(opt_result.x[j]), 8) for j, pid in enumerate(pids)}
+        predicted_disp = model.predict(poly.transform(opt_result.x.reshape(1, -1)))[0]
+        log_callback(f"  Surrogate tahmin: Disp={predicted_disp:.6f}, Weight={np.sum(opt_result.x):.4f}")
 
-        # Surrogate tahmini
-        x_cand_poly = poly.transform(opt_result.x.reshape(1, -1))
-        predicted_disp = model.predict(x_cand_poly)[0]
-        log_callback(f"  Surrogate tahmin: Disp = {predicted_disp:.6f}, Weight = {np.sum(opt_result.x):.4f}")
-
-        # Gerçek Nastran ile doğrula
-        log_callback(f"  Nastran ile doğrulama...")
         verify_dir = os.path.join(output_dir, f"surrogate_verify_{surr_iter}")
         try:
-            real_disp, real_stress, real_op2 = solve_and_evaluate(
+            real_disp, real_stress, _ = solve_and_evaluate(
                 nastran_exe, bdf_path, candidate_t, verify_dir, log_callback
             )
-            stress_ok, failed, max_vm = check_stress_constraints(real_stress, allowable_map)
-            log_thickness_table(candidate_t, real_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+            stress_ok, _, max_vm = check_stress_constraints(real_stress, allowable_map)
+            total_mass = tracker.record(f"Surr_{surr_iter+1}", candidate_t, real_disp, max_vm,
+                                        stress_ok, allowable_map, log_callback)
 
             error = abs(real_disp - predicted_disp)
             log_callback(f"  Tahmin hatası: {error:.6f} ({error/max(real_disp,1e-9)*100:.1f}%)")
 
-            # Eğitim verisine ekle
             X_train = np.vstack([X_train, opt_result.x.reshape(1, -1)])
             y_disp = np.append(y_disp, real_disp)
 
-            weight = compute_total_weight(candidate_t)
-            if real_disp <= max_disp_limit and stress_ok and weight < best_weight:
+            if real_disp <= max_disp_limit and stress_ok and total_mass < best_weight:
                 best_t = dict(candidate_t)
-                best_disp = real_disp
-                best_weight = weight
-                log_callback(f"  *** YENİ EN İYİ: Weight = {best_weight:.4f}, Disp = {best_disp:.6f}")
+                best_weight = total_mass
+                log_callback(f"  *** YENİ EN İYİ: Mass={best_weight:.4f} kg")
 
-            # Yakınsama kontrolü
             if error < step / 10 and real_disp <= max_disp_limit and stress_ok:
-                log_callback(f"  Yakınsadı! Tahmin hatası yeterince küçük.")
+                log_callback(f"  Yakınsadı!")
                 break
-
         except Exception as exc:
             log_callback(f"  Doğrulama hatası: {exc}")
 
-    # En iyi sonuç yoksa, feasible olan en düşük ağırlığı seç
     if best_t is None:
-        log_callback("\n  UYARI: Feasible çözüm bulunamadı, en düşük disp'li noktayı kullanıyorum.")
         best_idx = np.argmin(y_disp)
         best_t = {pid: round(float(X_train[best_idx, j]), 8) for j, pid in enumerate(pids)}
 
-    # Son çözüm
     log_callback(f"\n{'='*50}")
     log_callback("SON ÇÖZÜM")
     final_dir = os.path.join(output_dir, "final_result")
@@ -680,7 +732,7 @@ def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_ma
     )
     extract_results_csv(final_op2, final_dir, "final", log_callback)
     stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
-    log_thickness_table(best_t, final_disp, max_disp_limit, max_vm, stress_ok, log_callback)
+    tracker.record("Final", best_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
 
     progress_callback(100)
     return best_t, final_disp, final_stress
@@ -694,92 +746,95 @@ class NastranToolApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Eray-Tool | NX Nastran Thickness Optimizasyon Aracı")
-        self.root.geometry("850x700")
+        self.root.geometry("1100x750")
         self.root.resizable(True, True)
         self._build_ui()
 
     def _build_ui(self):
-        main_frame = ttk.Frame(self.root, padding=10)
+        # Ana yatay bölme: sol (kontroller+log) / sağ (grafik)
+        paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Sol panel
+        left_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=3)
+
+        main_frame = ttk.Frame(left_frame, padding=5)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         row = 0
-        # --- BDF Dosyası ---
-        ttk.Label(main_frame, text="BDF Dosyası:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.bdf_entry = ttk.Entry(main_frame, width=55)
-        self.bdf_entry.grid(row=row, column=1, columnspan=3, sticky=tk.EW, padx=4)
+        ttk.Label(main_frame, text="BDF Dosyası:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.bdf_entry = ttk.Entry(main_frame, width=45)
+        self.bdf_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
         ttk.Button(main_frame, text="Seç...", command=lambda: select_file(
             self.bdf_entry, "BDF Dosyası Seçiniz",
             [("BDF Dosyaları", "*.bdf *.dat *.nas"), ("Tüm Dosyalar", "*.*")]
-        )).grid(row=row, column=4)
+        )).grid(row=row, column=3)
 
-        # --- NX Nastran Exe ---
         row += 1
-        ttk.Label(main_frame, text="NX Nastran:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.nastran_entry = ttk.Entry(main_frame, width=55)
-        self.nastran_entry.grid(row=row, column=1, columnspan=3, sticky=tk.EW, padx=4)
+        ttk.Label(main_frame, text="NX Nastran:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.nastran_entry = ttk.Entry(main_frame, width=45)
+        self.nastran_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
         ttk.Button(main_frame, text="Seç...", command=lambda: select_file(
             self.nastran_entry, "NX Nastran Seçiniz",
             [("Çalıştırılabilir", "*.exe *.bat"), ("Tüm Dosyalar", "*.*")]
-        )).grid(row=row, column=4)
+        )).grid(row=row, column=3)
 
-        # --- Çıktı Klasörü ---
         row += 1
-        ttk.Label(main_frame, text="Çıktı Klasörü:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.output_entry = ttk.Entry(main_frame, width=55)
-        self.output_entry.grid(row=row, column=1, columnspan=3, sticky=tk.EW, padx=4)
+        ttk.Label(main_frame, text="Çıktı Klasörü:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.output_entry = ttk.Entry(main_frame, width=45)
+        self.output_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
         ttk.Button(main_frame, text="Seç...", command=lambda: select_directory(
             self.output_entry, "Çıktı Klasörü Seçiniz"
-        )).grid(row=row, column=4)
+        )).grid(row=row, column=3)
 
-        # --- Stress Allowable Excel ---
         row += 1
-        ttk.Label(main_frame, text="Allowable Excel:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.excel_entry = ttk.Entry(main_frame, width=55)
-        self.excel_entry.grid(row=row, column=1, columnspan=3, sticky=tk.EW, padx=4)
+        ttk.Label(main_frame, text="Allowable Excel:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.excel_entry = ttk.Entry(main_frame, width=45)
+        self.excel_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
         ttk.Button(main_frame, text="Seç...", command=lambda: select_file(
             self.excel_entry, "Stress Allowable Excel Seçiniz",
             [("Excel Dosyaları", "*.xlsx *.xls"), ("Tüm Dosyalar", "*.*")]
-        )).grid(row=row, column=4)
+        )).grid(row=row, column=3)
 
-        # --- Separator ---
         row += 1
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(
-            row=row, column=0, columnspan=5, sticky=tk.EW, pady=8
+            row=row, column=0, columnspan=4, sticky=tk.EW, pady=6
         )
 
-        # --- Optimizasyon Parametreleri ---
+        # Parametreler
         row += 1
-        param_frame = ttk.LabelFrame(main_frame, text="Optimizasyon Parametreleri", padding=8)
-        param_frame.grid(row=row, column=0, columnspan=5, sticky=tk.EW, pady=4)
+        param_frame = ttk.LabelFrame(main_frame, text="Optimizasyon Parametreleri", padding=6)
+        param_frame.grid(row=row, column=0, columnspan=4, sticky=tk.EW, pady=2)
 
-        ttk.Label(param_frame, text="Min Kalınlık:").grid(row=0, column=0, sticky=tk.W, padx=4)
-        self.min_t_entry = ttk.Entry(param_frame, width=10)
-        self.min_t_entry.grid(row=0, column=1, padx=4)
+        ttk.Label(param_frame, text="Min T:").grid(row=0, column=0, sticky=tk.W, padx=2)
+        self.min_t_entry = ttk.Entry(param_frame, width=8)
+        self.min_t_entry.grid(row=0, column=1, padx=2)
         self.min_t_entry.insert(0, "0.5")
 
-        ttk.Label(param_frame, text="Max Kalınlık:").grid(row=0, column=2, sticky=tk.W, padx=4)
-        self.max_t_entry = ttk.Entry(param_frame, width=10)
-        self.max_t_entry.grid(row=0, column=3, padx=4)
+        ttk.Label(param_frame, text="Max T:").grid(row=0, column=2, sticky=tk.W, padx=2)
+        self.max_t_entry = ttk.Entry(param_frame, width=8)
+        self.max_t_entry.grid(row=0, column=3, padx=2)
         self.max_t_entry.insert(0, "5.0")
 
-        ttk.Label(param_frame, text="Adım (Step):").grid(row=0, column=4, sticky=tk.W, padx=4)
-        self.step_entry = ttk.Entry(param_frame, width=10)
-        self.step_entry.grid(row=0, column=5, padx=4)
+        ttk.Label(param_frame, text="Step:").grid(row=0, column=4, sticky=tk.W, padx=2)
+        self.step_entry = ttk.Entry(param_frame, width=8)
+        self.step_entry.grid(row=0, column=5, padx=2)
         self.step_entry.insert(0, "0.1")
 
-        ttk.Label(param_frame, text="Max Disp:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=(6, 0))
-        self.max_disp_entry = ttk.Entry(param_frame, width=10)
-        self.max_disp_entry.grid(row=1, column=1, padx=4, pady=(6, 0))
+        ttk.Label(param_frame, text="Max Disp:").grid(row=1, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.max_disp_entry = ttk.Entry(param_frame, width=8)
+        self.max_disp_entry.grid(row=1, column=1, padx=2, pady=(4, 0))
         self.max_disp_entry.insert(0, "10.0")
 
-        ttk.Label(param_frame, text="Max İterasyon:").grid(row=1, column=2, sticky=tk.W, padx=4, pady=(6, 0))
-        self.max_iter_entry = ttk.Entry(param_frame, width=10)
-        self.max_iter_entry.grid(row=1, column=3, padx=4, pady=(6, 0))
+        ttk.Label(param_frame, text="Max Iter:").grid(row=1, column=2, sticky=tk.W, padx=2, pady=(4, 0))
+        self.max_iter_entry = ttk.Entry(param_frame, width=8)
+        self.max_iter_entry.grid(row=1, column=3, padx=2, pady=(4, 0))
         self.max_iter_entry.insert(0, "20")
 
-        ttk.Label(param_frame, text="Algoritma:").grid(row=2, column=0, sticky=tk.W, padx=4, pady=(6, 0))
+        ttk.Label(param_frame, text="Algoritma:").grid(row=2, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.algo_var = tk.StringVar()
-        algo_combo = ttk.Combobox(param_frame, textvariable=self.algo_var, state="readonly", width=35)
+        algo_combo = ttk.Combobox(param_frame, textvariable=self.algo_var, state="readonly", width=32)
         algo_combo["values"] = (
             "Sensitivity-Based",
             "SciPy Minimize (SLSQP)",
@@ -787,37 +842,83 @@ class NastranToolApp:
             "DOE + Surrogate Model (Önerilen)",
         )
         algo_combo.current(3)
-        algo_combo.grid(row=2, column=1, columnspan=4, sticky=tk.W, padx=4, pady=(6, 0))
+        algo_combo.grid(row=2, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
 
         main_frame.columnconfigure(1, weight=1)
 
-        # --- Butonlar ---
+        # Butonlar
         row += 1
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.grid(row=row, column=0, columnspan=5, pady=10)
+        btn_frame.grid(row=row, column=0, columnspan=4, pady=6)
 
         self.run_btn = ttk.Button(btn_frame, text="Optimizasyonu Başlat", command=self._on_run)
-        self.run_btn.pack(side=tk.LEFT, padx=8)
+        self.run_btn.pack(side=tk.LEFT, padx=6)
 
-        self.single_btn = ttk.Button(btn_frame, text="Tek Çözüm (Mevcut BDF)", command=self._on_single_run)
-        self.single_btn.pack(side=tk.LEFT, padx=8)
+        self.single_btn = ttk.Button(btn_frame, text="Tek Çözüm", command=self._on_single_run)
+        self.single_btn.pack(side=tk.LEFT, padx=6)
 
-        # --- İlerleme ---
+        # İlerleme
         row += 1
         self.progress = ttk.Progressbar(main_frame, mode="determinate")
-        self.progress.grid(row=row, column=0, columnspan=5, sticky=tk.EW, pady=(0, 4))
+        self.progress.grid(row=row, column=0, columnspan=4, sticky=tk.EW, pady=(0, 4))
 
-        # --- Log ---
+        # Log
         row += 1
         ttk.Label(main_frame, text="İşlem Günlüğü:").grid(row=row, column=0, sticky=tk.W)
         row += 1
-        self.log_text = tk.Text(main_frame, height=14, state=tk.DISABLED, wrap=tk.WORD)
-        self.log_text.grid(row=row, column=0, columnspan=4, sticky=tk.NSEW)
+        self.log_text = tk.Text(main_frame, height=12, state=tk.DISABLED, wrap=tk.WORD)
+        self.log_text.grid(row=row, column=0, columnspan=3, sticky=tk.NSEW)
         main_frame.rowconfigure(row, weight=1)
 
         scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        scrollbar.grid(row=row, column=4, sticky=tk.NS)
+        scrollbar.grid(row=row, column=3, sticky=tk.NS)
         self.log_text.configure(yscrollcommand=scrollbar.set)
+
+        # Sağ panel: Grafik
+        right_frame = ttk.Frame(paned)
+        paned.add(right_frame, weight=2)
+
+        self.fig, (self.ax_mass, self.ax_disp) = plt.subplots(2, 1, figsize=(5, 5))
+        self.fig.tight_layout(pad=3.0)
+
+        self.ax_mass.set_title("Total Mass vs Iteration", fontsize=10)
+        self.ax_mass.set_xlabel("Iteration")
+        self.ax_mass.set_ylabel("Mass (kg)")
+        self.ax_mass.grid(True, alpha=0.3)
+
+        self.ax_disp.set_title("Max Displacement vs Iteration", fontsize=10)
+        self.ax_disp.set_xlabel("Iteration")
+        self.ax_disp.set_ylabel("Max Disp")
+        self.ax_disp.grid(True, alpha=0.3)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas.draw()
+
+    def _update_plot(self, iterations, masses, displacements, max_disp_limit):
+        """Thread-safe grafik güncelleme."""
+        def _do_update():
+            self.ax_mass.clear()
+            self.ax_mass.set_title("Total Mass vs Iteration", fontsize=10)
+            self.ax_mass.set_xlabel("Iteration")
+            self.ax_mass.set_ylabel("Mass (kg)")
+            self.ax_mass.grid(True, alpha=0.3)
+            self.ax_mass.plot(iterations, masses, "b-o", markersize=4, label="Mass")
+            self.ax_mass.legend(fontsize=8)
+
+            self.ax_disp.clear()
+            self.ax_disp.set_title("Max Displacement vs Iteration", fontsize=10)
+            self.ax_disp.set_xlabel("Iteration")
+            self.ax_disp.set_ylabel("Max Disp")
+            self.ax_disp.grid(True, alpha=0.3)
+            self.ax_disp.plot(iterations, displacements, "r-o", markersize=4, label="Max Disp")
+            self.ax_disp.axhline(y=max_disp_limit, color="green", linestyle="--",
+                                 linewidth=1.5, label=f"Limit ({max_disp_limit})")
+            self.ax_disp.legend(fontsize=8)
+
+            self.fig.tight_layout(pad=3.0)
+            self.canvas.draw()
+        self.root.after(0, _do_update)
 
     def _log(self, message):
         def _append():
@@ -857,7 +958,6 @@ class NastranToolApp:
         self.run_btn.configure(state=tk.NORMAL)
         self.single_btn.configure(state=tk.NORMAL)
 
-    # --- Tek çözüm ---
     def _on_single_run(self):
         vals = self._validate_common()
         if not vals:
@@ -882,7 +982,22 @@ class NastranToolApp:
             extract_results_csv(op2_model, output_dir, "result", self._log)
 
             max_disp = get_max_absolute_displacement(op2_model)
-            self._log(f"\nMax Absolute Displacement: {max_disp:.6f}")
+            max_vm = max(get_von_mises_stresses(op2_model).values()) if get_von_mises_stresses(op2_model) else 0.0
+
+            # BDF'den mass bilgisi
+            self._log("\nBDF okunuyor (mass hesabı)...")
+            pids, pid_mid_map, mid_density_map, pid_area_map = read_bdf_model(bdf_path)
+            # Mevcut kalınlıkları oku
+            bdf_model = BDF()
+            bdf_model.read_bdf(bdf_path, xref=False)
+            current_t = {}
+            for pid, prop in bdf_model.properties.items():
+                if prop.type == "PSHELL":
+                    current_t[pid] = prop.t
+            total_mass, _ = compute_real_mass(current_t, pid_mid_map, mid_density_map, pid_area_map)
+
+            log_mass_summary(total_mass, max_disp, 0, max_vm, True, self._log)
+
             self._log("İŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo("Başarılı", "Sonuçlar CSV olarak yazıldı!"))
         except Exception as exc:
@@ -892,7 +1007,6 @@ class NastranToolApp:
         finally:
             self.root.after(0, self._finish)
 
-    # --- Optimizasyon ---
     def _on_run(self):
         vals = self._validate_common()
         if not vals:
@@ -938,57 +1052,93 @@ class NastranToolApp:
             self._log(f"  Max Disp: {max_disp_limit}  Max İter: {max_iter}")
             self._log("=" * 60)
 
-            pids = read_pshell_pids(bdf_path)
+            # BDF'den PSHELL, malzeme ve alan bilgisi oku
+            self._log("\nBDF modeli okunuyor...")
+            pids, pid_mid_map, mid_density_map, pid_area_map = read_bdf_model(bdf_path)
             if not pids:
                 raise ValueError("BDF dosyasında PSHELL kartı bulunamadı!")
-            self._log(f"\n  {len(pids)} PSHELL bulundu: {pids[:10]}{'...' if len(pids) > 10 else ''}")
+            self._log(f"  {len(pids)} PSHELL bulundu")
+            self._log(f"  {len(mid_density_map)} malzeme density yüklendi")
+            total_area = sum(pid_area_map.values())
+            self._log(f"  Toplam eleman alanı: {total_area:.4f}")
 
             allowable_map = load_allowable_excel(excel_path)
             self._log(f"  {len(allowable_map)} element allowable yüklendi.")
 
+            # Tracker oluştur
+            tracker = IterationTracker(
+                pid_mid_map, mid_density_map, pid_area_map,
+                max_disp_limit, self._update_plot
+            )
+
+            # Algoritma çalıştır
             if "DOE" in algo_name:
                 result_t, final_disp, final_stress = optimize_doe_surrogate(
                     bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress
+                    self._log, self._set_progress, tracker
                 )
             elif "Sensitivity" in algo_name and "Hybrid" not in algo_name:
                 result_t, final_disp, final_stress = optimize_sensitivity(
                     bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress
+                    self._log, self._set_progress, tracker
                 )
             elif "SciPy" in algo_name:
                 result_t, final_disp, final_stress = optimize_scipy(
                     bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress
+                    self._log, self._set_progress, tracker
                 )
             else:
                 result_t, final_disp, final_stress = optimize_hybrid(
                     bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress
+                    self._log, self._set_progress, tracker
                 )
 
             # Sonuç raporu
             self._log(f"\n{'='*60}")
             self._log("OPTİMİZASYON SONUÇLARI")
             stress_ok, failed, max_vm = check_stress_constraints(final_stress, allowable_map)
-            log_thickness_table(result_t, final_disp, max_disp_limit, max_vm, stress_ok, self._log)
+            total_mass, pid_mass = compute_real_mass(
+                result_t, pid_mid_map, mid_density_map, pid_area_map
+            )
+            log_mass_summary(total_mass, final_disp, max_disp_limit, max_vm, stress_ok, self._log)
 
-            t_rows = [{"PID": pid, "Thickness": t} for pid, t in sorted(result_t.items())]
+            # Kalınlık + mass CSV
+            t_rows = []
+            for pid in sorted(result_t.keys()):
+                t_rows.append({
+                    "PID": pid,
+                    "Thickness": result_t[pid],
+                    "Area": pid_area_map.get(pid, 0),
+                    "Mass": pid_mass.get(pid, 0),
+                })
             t_df = pd.DataFrame(t_rows)
             t_csv = os.path.join(output_dir, "optimized_thicknesses.csv")
             t_df.to_csv(t_csv, index=False)
             self._log(f"  Kalınlık dağılımı: {t_csv}")
 
+            # İterasyon geçmişi CSV
+            hist_df = pd.DataFrame({
+                "Iteration": tracker.iterations,
+                "Mass_kg": tracker.masses,
+                "MaxDisplacement": tracker.displacements,
+                "MaxVonMises": tracker.stresses,
+            })
+            hist_csv = os.path.join(output_dir, "iteration_history.csv")
+            hist_df.to_csv(hist_csv, index=False)
+
+            # Grafiği kaydet
+            self.fig.savefig(os.path.join(output_dir, "optimization_plot.png"), dpi=150)
+
             self._log("\nİŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo(
                 "Optimizasyon Tamamlandı",
+                f"Total Mass: {total_mass:.4f} kg\n"
                 f"Max Disp: {final_disp:.4f}\n"
-                f"Max VM: {max_vm:.2f}\n"
-                f"Toplam Kalınlık: {compute_total_weight(result_t):.4f}\n\n"
+                f"Max VM: {max_vm:.2f}\n\n"
                 f"Detaylar: {t_csv}"
             ))
 

@@ -1378,23 +1378,43 @@ class NastranToolApp:
             messagebox.showerror("Hata", f"BDF okuma hatası: {exc}")
             return
 
+        # Thickness aralığına göre yardımcı değerler
+        import math
+        t_range = max_t - min_t
+        n_steps = int(round(t_range / step))  # bir PSHELL'in max-min arası adım sayısı
+
         # Algoritma bazlı tahmini run hesabı
         if "Sensitivity" in algo_name and "Hybrid" not in algo_name:
-            # Her iterasyon: 1 ref + n_pids pertürbasyon + 1 final
-            total_run = (1 + n_pids) * max_iter + 1
-            detail = f"({1 + n_pids}) x {max_iter} iter + 1 final"
+            # Her iterasyonda max n_pids/2 PSHELL bir step azalır.
+            # Tüm PSHELL'ler min_t'ye ulaştığında durur.
+            # max_meaningful_iter = ceil(2 * n_steps) (her PSHELL n_steps adımda min'e iner,
+            # her iter'de yarısı azalır -> 2*n_steps iter yeterli)
+            max_meaningful = math.ceil(2 * n_steps)
+            eff_iter = min(max_iter, max_meaningful)
+            total_run = (1 + n_pids) * eff_iter + 1
+            detail = (f"({1 + n_pids}) x {eff_iter} iter + 1 final"
+                      f"  [max_iter={max_iter}, t_adım={n_steps}, eff_iter=min({max_iter},{max_meaningful})]")
 
         elif "SciPy" in algo_name:
             # Optimizer kontrollü, en fazla ~max_iter constraint eval + 1 final
+            # eps=step: büyük step -> daha kaba FD -> daha az iter
             total_run = max_iter + 1
-            detail = f"~{max_iter} eval + 1 final (optimizer kontrollü)"
+            detail = f"~{max_iter} eval + 1 final (optimizer kontrollü, eps={step})"
 
         elif "Hybrid" in algo_name:
-            # Faz 1: max 20 bisection, Faz 2: sensitivity
-            max_bisect = 20
-            remaining = max(3, max_iter - max_bisect)
-            total_run = max_bisect + (1 + n_pids) * remaining + 1
-            detail = f"{max_bisect} bisect + ({1 + n_pids}) x {remaining} sens + 1 final"
+            # Faz 1: Bisection: high-low > step/2 olana kadar ikiye böler
+            # bisect_count = min(20, ceil(log2(2 * t_range / step)))
+            if t_range > 0 and step > 0:
+                bisect_count = min(20, math.ceil(math.log2(2 * t_range / step)))
+            else:
+                bisect_count = 20
+            # Faz 2: Sensitivity kalan iterasyonlarla
+            remaining_sens = max(3, max_iter - bisect_count)
+            max_meaningful_sens = math.ceil(2 * n_steps)
+            eff_sens = min(remaining_sens, max_meaningful_sens)
+            total_run = bisect_count + (1 + n_pids) * eff_sens + 1
+            detail = (f"{bisect_count} bisect + ({1 + n_pids}) x {eff_sens} sens + 1 final"
+                      f"  [bisect=min(20,ceil(log2(2*{t_range:.1f}/{step})))={bisect_count}]")
 
         elif "DOE" in algo_name:
             # DOE samples + surrogate verification + 1 final
@@ -1404,15 +1424,19 @@ class NastranToolApp:
             detail = f"{n_doe} DOE + {remaining} verify + 1 final"
 
         elif "FD" in algo_name or "SQP" in algo_name:
-            # Her iterasyon: 1 constraint + 1 ref + n_pids FD pertürbasyon + 1 final
+            # Her iterasyonda: 1 ref + n_pids FD pertürbasyon
+            # gtol=step/10: küçük step -> daha hassas -> daha çok iter
+            # Ancak optimizer max_iter'den fazla çalışmaz
             total_run = (1 + n_pids) * max_iter + 1
-            detail = f"({1 + n_pids}) x {max_iter} iter + 1 final (cache ile daha az olabilir)"
+            detail = (f"({1 + n_pids}) x {max_iter} iter + 1 final"
+                      f"  [gtol={step/10:.4f}, cache ile daha az olabilir]")
 
         elif "Genetic" in algo_name or "GA" in algo_name:
             # pop_size * n_generations + 1 final
+            # step sadece yuvarlama için kullanılır, run sayısını değiştirmez
             pop_size = max(10, 2 * n_pids)
             total_run = pop_size * max_iter + 1
-            detail = f"{pop_size} pop x {max_iter} gen + 1 final"
+            detail = f"{pop_size} pop x {max_iter} gen + 1 final  [step={step} yuvarlama]"
 
         else:
             total_run = max_iter + 1
@@ -1421,7 +1445,8 @@ class NastranToolApp:
         self.total_run_var.set(str(total_run))
         self._log(f"Total Run hesaplandı: {total_run}")
         self._log(f"  Algoritma: {algo_name}")
-        self._log(f"  n_pids={n_pids}, max_iter={max_iter}")
+        self._log(f"  n_pids={n_pids}, max_iter={max_iter}, min_t={min_t}, max_t={max_t}, step={step}")
+        self._log(f"  Thickness aralığı: {n_steps} adım ({min_t} -> {max_t}, step={step})")
         self._log(f"  Detay: {detail}")
 
     def _validate_common(self):

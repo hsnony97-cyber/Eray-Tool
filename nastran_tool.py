@@ -1345,18 +1345,84 @@ class NastranToolApp:
         self.root.after(0, lambda v=value: self.progress.configure(value=v))
 
     def _calc_total_run(self):
+        # BDF dosyasından n_pids al
+        bdf_path = self.bdf_entry.get().strip()
+        if not bdf_path or not os.path.isfile(bdf_path):
+            messagebox.showerror("Hata", "Total Run hesabı için BDF dosyası gereklidir.")
+            return
+
         try:
             min_t = float(self.min_t_entry.get().strip())
             max_t = float(self.max_t_entry.get().strip())
             step = float(self.step_entry.get().strip())
+            max_iter = int(self.max_iter_entry.get().strip())
             if step <= 0 or min_t >= max_t:
                 messagebox.showerror("Hata", "Min < Max ve Step > 0 olmalıdır.")
                 return
-            total_run = int(round((max_t - min_t) / step)) + 1
-            self.total_run_var.set(str(total_run))
-            self._log(f"Total Run hesaplandı: {total_run}  (Min={min_t}, Max={max_t}, Step={step})")
         except ValueError:
-            messagebox.showerror("Hata", "Min T, Max T ve Step sayısal olmalıdır.")
+            messagebox.showerror("Hata", "Parametre değerleri sayısal olmalıdır.")
+            return
+
+        algo_name = self.algo_var.get()
+
+        # BDF'den PSHELL sayısını oku
+        try:
+            self._log("BDF okunuyor (PSHELL sayısı için)...")
+            pids, _, _, _ = read_bdf_model(bdf_path)
+            n_pids = len(pids)
+            if n_pids == 0:
+                messagebox.showerror("Hata", "BDF dosyasında PSHELL bulunamadı.")
+                return
+            self._log(f"  {n_pids} PSHELL bulundu.")
+        except Exception as exc:
+            messagebox.showerror("Hata", f"BDF okuma hatası: {exc}")
+            return
+
+        # Algoritma bazlı tahmini run hesabı
+        if "Sensitivity" in algo_name and "Hybrid" not in algo_name:
+            # Her iterasyon: 1 ref + n_pids pertürbasyon + 1 final
+            total_run = (1 + n_pids) * max_iter + 1
+            detail = f"({1 + n_pids}) x {max_iter} iter + 1 final"
+
+        elif "SciPy" in algo_name:
+            # Optimizer kontrollü, en fazla ~max_iter constraint eval + 1 final
+            total_run = max_iter + 1
+            detail = f"~{max_iter} eval + 1 final (optimizer kontrollü)"
+
+        elif "Hybrid" in algo_name:
+            # Faz 1: max 20 bisection, Faz 2: sensitivity
+            max_bisect = 20
+            remaining = max(3, max_iter - max_bisect)
+            total_run = max_bisect + (1 + n_pids) * remaining + 1
+            detail = f"{max_bisect} bisect + ({1 + n_pids}) x {remaining} sens + 1 final"
+
+        elif "DOE" in algo_name:
+            # DOE samples + surrogate verification + 1 final
+            n_doe = min(max(2 * n_pids + 1, 10), max(max_iter // 2, 5))
+            remaining = max(max_iter - n_doe, 3)
+            total_run = n_doe + remaining + 1
+            detail = f"{n_doe} DOE + {remaining} verify + 1 final"
+
+        elif "FD" in algo_name or "SQP" in algo_name:
+            # Her iterasyon: 1 constraint + 1 ref + n_pids FD pertürbasyon + 1 final
+            total_run = (1 + n_pids) * max_iter + 1
+            detail = f"({1 + n_pids}) x {max_iter} iter + 1 final (cache ile daha az olabilir)"
+
+        elif "Genetic" in algo_name or "GA" in algo_name:
+            # pop_size * n_generations + 1 final
+            pop_size = max(10, 2 * n_pids)
+            total_run = pop_size * max_iter + 1
+            detail = f"{pop_size} pop x {max_iter} gen + 1 final"
+
+        else:
+            total_run = max_iter + 1
+            detail = "bilinmeyen algoritma"
+
+        self.total_run_var.set(str(total_run))
+        self._log(f"Total Run hesaplandı: {total_run}")
+        self._log(f"  Algoritma: {algo_name}")
+        self._log(f"  n_pids={n_pids}, max_iter={max_iter}")
+        self._log(f"  Detay: {detail}")
 
     def _validate_common(self):
         bdf_path = self.bdf_entry.get().strip()

@@ -12,10 +12,12 @@ Algoritmalar:
 """
 
 import os
+import glob as globmod
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -316,7 +318,7 @@ def log_mass_summary(total_mass, max_disp, max_disp_limit, max_vm, stress_ok, lo
 
 
 def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callback):
-    """BDF'yi değiştir, çöz, sonuçları oku ve CSV yaz."""
+    """BDF'yi değiştir, çöz, sonuçları oku, CSV yaz, OP2 ve büyük dosyaları sil."""
     os.makedirs(work_dir, exist_ok=True)
     bdf_basename = os.path.basename(bdf_path)
     modified_bdf = os.path.join(work_dir, bdf_basename)
@@ -332,7 +334,53 @@ def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callb
     iter_label = os.path.basename(work_dir)
     extract_results_csv(op2_model, work_dir, iter_label, log_callback)
 
-    return max_disp, stress_map, op2_model
+    # OP2 ve diğer büyük Nastran çıktı dosyalarını sil (CSV'ler korunur)
+    del op2_model
+    cleanup_nastran_outputs(work_dir, log_callback)
+
+    return max_disp, stress_map
+
+
+def cleanup_nastran_outputs(work_dir, log_callback):
+    """OP2, f06, f04, log, DBALL, MASTER gibi büyük Nastran dosyalarını siler."""
+    extensions = ("*.op2", "*.f06", "*.f04", "*.log", "*.DBALL", "*.MASTER",
+                  "*.IFPDAT", "*.nx_pre_prc", "*.pch")
+    deleted = 0
+    for ext in extensions:
+        for fpath in globmod.glob(os.path.join(work_dir, ext)):
+            try:
+                os.remove(fpath)
+                deleted += 1
+            except OSError:
+                pass
+    if deleted:
+        log_callback(f"  {deleted} Nastran çıktı dosyası silindi.")
+
+
+def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback):
+    """
+    Birden fazla thickness kombinasyonunu paralel olarak çözer.
+    batch_items: [(thickness_map, work_dir), ...]
+    Returns: [(thickness_map, max_disp, stress_map), ...] - aynı sırada
+    """
+    results = [None] * len(batch_items)
+
+    def _solve_one(idx, thickness_map, work_dir):
+        max_disp, stress_map = solve_and_evaluate(
+            nastran_exe, bdf_path, thickness_map, work_dir, log_callback
+        )
+        return idx, thickness_map, max_disp, stress_map
+
+    with ThreadPoolExecutor(max_workers=n_parallel) as executor:
+        futures = []
+        for idx, (t_map, w_dir) in enumerate(batch_items):
+            futures.append(executor.submit(_solve_one, idx, t_map, w_dir))
+
+        for future in as_completed(futures):
+            idx, t_map, max_disp, stress_map = future.result()
+            results[idx] = (t_map, max_disp, stress_map)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +429,9 @@ class IterationTracker:
 
 def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                          min_t, max_t, step, max_disp_limit, max_iter,
-                         log_callback, progress_callback, tracker):
+                         log_callback, progress_callback, tracker, n_parallel=1):
     n = len(pids)
-    log_callback(f"\n  Toplam {n} PSHELL optimize edilecek.")
+    log_callback(f"\n  Toplam {n} PSHELL optimize edilecek. (Paralel: {n_parallel})")
     current_t = {pid: max_t for pid in pids}
 
     for iteration in range(max_iter):
@@ -393,7 +441,7 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
         ref_dir = os.path.join(output_dir, f"sens_iter{iteration}_ref")
         log_callback("  Referans çözüm...")
-        ref_disp, ref_stress, _ = solve_and_evaluate(
+        ref_disp, ref_stress = solve_and_evaluate(
             nastran_exe, bdf_path, current_t, ref_dir, log_callback
         )
 
@@ -416,29 +464,59 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         log_callback("  Hassasiyet analizi yapılıyor...")
         sensitivities = {}
 
-        for i, pid in enumerate(pids):
-            if current_t[pid] <= min_t + 1e-9:
-                sensitivities[pid] = float('inf')
-                continue
+        # Pertürbasyon yapılacak PID'leri belirle
+        perturbable_pids = [pid for pid in pids if current_t[pid] > min_t + 1e-9]
+        skip_pids = [pid for pid in pids if current_t[pid] <= min_t + 1e-9]
+        for pid in skip_pids:
+            sensitivities[pid] = float('inf')
 
-            perturbed_t = dict(current_t)
-            perturbed_t[pid] = current_t[pid] - step
+        # Paralel pertürbasyon çözümleri
+        if perturbable_pids and n_parallel > 1:
+            batch_items = []
+            for pid in perturbable_pids:
+                perturbed_t = dict(current_t)
+                perturbed_t[pid] = current_t[pid] - step
+                pert_dir = os.path.join(output_dir, f"sens_iter{iteration}_p{pid}")
+                batch_items.append((perturbed_t, pert_dir))
 
-            pert_dir = os.path.join(output_dir, f"sens_iter{iteration}_p{pid}")
+            log_callback(f"  {len(batch_items)} pertürbasyon paralel çözülüyor ({n_parallel} worker)...")
             try:
-                pert_disp, pert_stress, _ = solve_and_evaluate(
-                    nastran_exe, bdf_path, perturbed_t, pert_dir, log_callback
-                )
-                sensitivity = (pert_disp - ref_disp) / step
-                sensitivities[pid] = sensitivity
+                batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback)
+                for i, pid in enumerate(perturbable_pids):
+                    _, pert_disp, pert_stress = batch_results[i]
+                    sensitivity = (pert_disp - ref_disp) / step
+                    sensitivities[pid] = sensitivity
 
-                s_ok, _, _ = check_stress_constraints(pert_stress, allowable_map)
-                if not s_ok:
+                    s_ok, _, _ = check_stress_constraints(pert_stress, allowable_map)
+                    if not s_ok:
+                        sensitivities[pid] = float('inf')
+
+                    log_callback(f"    PID {pid}: dDisp/dT = {sensitivities[pid]:.6f} ({i+1}/{n})")
+            except Exception as exc:
+                log_callback(f"  Paralel çözüm hatası: {exc}")
+                for pid in perturbable_pids:
                     sensitivities[pid] = float('inf')
-            except Exception:
-                sensitivities[pid] = float('inf')
+        else:
+            # Seri pertürbasyon çözümleri
+            for i, pid in enumerate(perturbable_pids):
+                perturbed_t = dict(current_t)
+                perturbed_t[pid] = current_t[pid] - step
 
-            log_callback(f"    PID {pid}: dDisp/dT = {sensitivities[pid]:.6f} ({i+1}/{n})")
+                pert_dir = os.path.join(output_dir, f"sens_iter{iteration}_p{pid}")
+                try:
+                    pert_disp, pert_stress = solve_and_evaluate(
+                        nastran_exe, bdf_path, perturbed_t, pert_dir, log_callback
+                    )
+                    sensitivity = (pert_disp - ref_disp) / step
+                    sensitivities[pid] = sensitivity
+
+                    s_ok, _, _ = check_stress_constraints(pert_stress, allowable_map)
+                    if not s_ok:
+                        sensitivities[pid] = float('inf')
+                except Exception:
+                    sensitivities[pid] = float('inf')
+
+                log_callback(f"    PID {pid}: dDisp/dT = {sensitivities[pid]:.6f} ({i+1}/{n})")
 
         sorted_pids = sorted(
             [p for p in pids if sensitivities[p] < float('inf')],
@@ -466,10 +544,9 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     log_callback(f"\n{'='*50}")
     log_callback("SON ÇÖZÜM")
     final_dir = os.path.join(output_dir, "final_result")
-    final_disp, final_stress, final_op2 = solve_and_evaluate(
+    final_disp, final_stress = solve_and_evaluate(
         nastran_exe, bdf_path, current_t, final_dir, log_callback
     )
-    extract_results_csv(final_op2, final_dir, "final", log_callback)
     stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
     tracker.record("Final", current_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
 
@@ -483,7 +560,7 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
 def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                    min_t, max_t, step, max_disp_limit, max_iter,
-                   log_callback, progress_callback, tracker):
+                   log_callback, progress_callback, tracker, n_parallel=1):
     from scipy.optimize import minimize
 
     n = len(pids)
@@ -501,7 +578,7 @@ def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         progress_callback(min(eval_count[0] / max_iter * 100, 99))
 
         try:
-            max_disp, stress_map, _ = solve_and_evaluate(
+            max_disp, stress_map = solve_and_evaluate(
                 nastran_exe, bdf_path, t_map, work_dir, log_callback
             )
             stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
@@ -525,10 +602,9 @@ def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     final_t = {pid: round(float(result.x[i]), 8) for i, pid in enumerate(pids)}
 
     final_dir = os.path.join(output_dir, "final_result")
-    final_disp, final_stress, final_op2 = solve_and_evaluate(
+    final_disp, final_stress = solve_and_evaluate(
         nastran_exe, bdf_path, final_t, final_dir, log_callback
     )
-    extract_results_csv(final_op2, final_dir, "final", log_callback)
     stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
     tracker.record("Final", final_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
 
@@ -542,7 +618,7 @@ def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
 def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
-                    log_callback, progress_callback, tracker):
+                    log_callback, progress_callback, tracker, n_parallel=1):
     log_callback("\n  AŞAMA 1: Bisection ile başlangıç kalınlığı...")
 
     low, high = min_t, max_t
@@ -560,7 +636,7 @@ def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         progress_callback(bisect_iter / (max_bisect + max_iter) * 100)
 
         try:
-            max_disp, stress_map, _ = solve_and_evaluate(
+            max_disp, stress_map = solve_and_evaluate(
                 nastran_exe, bdf_path, t_map, work_dir, log_callback
             )
             stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
@@ -583,7 +659,7 @@ def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     return optimize_sensitivity(
         bdf_path, nastran_exe, os.path.join(output_dir, "sensitivity_phase"),
         pids, allowable_map, min_t, best_uniform_t, step, max_disp_limit, remaining_iter,
-        log_callback, progress_callback, tracker
+        log_callback, progress_callback, tracker, n_parallel=n_parallel
     )
 
 
@@ -604,7 +680,7 @@ def latin_hypercube_sampling(n_samples, n_vars, min_vals, max_vals, seed=42):
 
 def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                            min_t, max_t, step, max_disp_limit, max_iter,
-                           log_callback, progress_callback, tracker):
+                           log_callback, progress_callback, tracker, n_parallel=1):
     from sklearn.linear_model import Ridge
     from sklearn.preprocessing import PolynomialFeatures
     from scipy.optimize import minimize
@@ -615,7 +691,7 @@ def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_ma
     n_doe_samples = min(max(2 * n_vars + 1, 10), max(max_iter // 2, 5))
 
     log_callback(f"\n  DOE + Surrogate Model")
-    log_callback(f"  {n_vars} PSHELL, {n_doe_samples} DOE numune")
+    log_callback(f"  {n_vars} PSHELL, {n_doe_samples} DOE numune, Paralel: {n_parallel}")
     log_callback(f"\n  AŞAMA 1: Latin Hypercube Sampling...")
 
     samples = latin_hypercube_sampling(n_doe_samples, n_vars, min_vals, max_vals)
@@ -623,24 +699,47 @@ def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_ma
     X_train = []
     y_disp = []
 
-    for i in range(n_doe_samples):
-        t_map = {pid: round(float(samples[i, j]), 8) for j, pid in enumerate(pids)}
-        work_dir = os.path.join(output_dir, f"doe_sample_{i}")
-        log_callback(f"\n  DOE Numune {i+1}/{n_doe_samples}")
-        progress_callback((i / n_doe_samples) * 40)
+    if n_parallel > 1:
+        # Paralel DOE çözümleri
+        batch_items = []
+        for i in range(n_doe_samples):
+            t_map = {pid: round(float(samples[i, j]), 8) for j, pid in enumerate(pids)}
+            work_dir = os.path.join(output_dir, f"doe_sample_{i}")
+            batch_items.append((t_map, work_dir))
 
+        log_callback(f"  {n_doe_samples} DOE numune paralel çözülüyor ({n_parallel} worker)...")
         try:
-            max_disp, stress_map, _ = solve_and_evaluate(
-                nastran_exe, bdf_path, t_map, work_dir, log_callback
-            )
-            stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
-            tracker.record(f"DOE_{i+1}", t_map, max_disp, max_vm, stress_ok,
-                           allowable_map, log_callback)
-
-            X_train.append(samples[i])
-            y_disp.append(max_disp)
+            batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback)
+            for i, (t_map, max_disp, stress_map) in enumerate(batch_results):
+                progress_callback((i / n_doe_samples) * 40)
+                stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+                tracker.record(f"DOE_{i+1}", t_map, max_disp, max_vm, stress_ok,
+                               allowable_map, log_callback)
+                X_train.append(samples[i])
+                y_disp.append(max_disp)
+                log_callback(f"  DOE Numune {i+1}/{n_doe_samples} tamamlandı.")
         except Exception as exc:
-            log_callback(f"    Nastran hatası: {exc}")
+            log_callback(f"  Paralel DOE hatası: {exc}")
+    else:
+        # Seri DOE çözümleri
+        for i in range(n_doe_samples):
+            t_map = {pid: round(float(samples[i, j]), 8) for j, pid in enumerate(pids)}
+            work_dir = os.path.join(output_dir, f"doe_sample_{i}")
+            log_callback(f"\n  DOE Numune {i+1}/{n_doe_samples}")
+            progress_callback((i / n_doe_samples) * 40)
+
+            try:
+                max_disp, stress_map = solve_and_evaluate(
+                    nastran_exe, bdf_path, t_map, work_dir, log_callback
+                )
+                stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+                tracker.record(f"DOE_{i+1}", t_map, max_disp, max_vm, stress_ok,
+                               allowable_map, log_callback)
+
+                X_train.append(samples[i])
+                y_disp.append(max_disp)
+            except Exception as exc:
+                log_callback(f"    Nastran hatası: {exc}")
 
     if len(X_train) < 3:
         raise RuntimeError("Yeterli DOE numunesi çözülemedi!")
@@ -696,7 +795,7 @@ def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_ma
 
         verify_dir = os.path.join(output_dir, f"surrogate_verify_{surr_iter}")
         try:
-            real_disp, real_stress, _ = solve_and_evaluate(
+            real_disp, real_stress = solve_and_evaluate(
                 nastran_exe, bdf_path, candidate_t, verify_dir, log_callback
             )
             stress_ok, _, max_vm = check_stress_constraints(real_stress, allowable_map)
@@ -727,10 +826,9 @@ def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_ma
     log_callback(f"\n{'='*50}")
     log_callback("SON ÇÖZÜM")
     final_dir = os.path.join(output_dir, "final_result")
-    final_disp, final_stress, final_op2 = solve_and_evaluate(
+    final_disp, final_stress = solve_and_evaluate(
         nastran_exe, bdf_path, best_t, final_dir, log_callback
     )
-    extract_results_csv(final_op2, final_dir, "final", log_callback)
     stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
     tracker.record("Final", best_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
 
@@ -831,6 +929,11 @@ class NastranToolApp:
         self.max_iter_entry = ttk.Entry(param_frame, width=8)
         self.max_iter_entry.grid(row=1, column=3, padx=2, pady=(4, 0))
         self.max_iter_entry.insert(0, "20")
+
+        ttk.Label(param_frame, text="Paralel Run:").grid(row=1, column=4, sticky=tk.W, padx=2, pady=(4, 0))
+        self.n_parallel_entry = ttk.Entry(param_frame, width=8)
+        self.n_parallel_entry.grid(row=1, column=5, padx=2, pady=(4, 0))
+        self.n_parallel_entry.insert(0, "1")
 
         ttk.Label(param_frame, text="Algoritma:").grid(row=2, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.algo_var = tk.StringVar()
@@ -1024,6 +1127,9 @@ class NastranToolApp:
             step = float(self.step_entry.get().strip())
             max_disp_limit = float(self.max_disp_entry.get().strip())
             max_iter = int(self.max_iter_entry.get().strip())
+            n_parallel = int(self.n_parallel_entry.get().strip())
+            if n_parallel < 1:
+                n_parallel = 1
         except ValueError:
             messagebox.showerror("Hata", "Parametre değerleri sayısal olmalıdır.")
             return
@@ -1039,17 +1145,17 @@ class NastranToolApp:
         threading.Thread(
             target=self._opt_worker,
             args=(bdf_path, nastran_exe, output_dir, excel_path,
-                  min_t, max_t, step, max_disp_limit, max_iter, algo_name),
+                  min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel),
             daemon=True,
         ).start()
 
     def _opt_worker(self, bdf_path, nastran_exe, output_dir, excel_path,
-                    min_t, max_t, step, max_disp_limit, max_iter, algo_name):
+                    min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel):
         try:
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
             self._log(f"  Min: {min_t}  Max: {max_t}  Step: {step}")
-            self._log(f"  Max Disp: {max_disp_limit}  Max İter: {max_iter}")
+            self._log(f"  Max Disp: {max_disp_limit}  Max İter: {max_iter}  Paralel: {n_parallel}")
             self._log("=" * 60)
 
             # BDF'den PSHELL, malzeme ve alan bilgisi oku
@@ -1076,25 +1182,25 @@ class NastranToolApp:
                 result_t, final_disp, final_stress = optimize_doe_surrogate(
                     bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress, tracker
+                    self._log, self._set_progress, tracker, n_parallel=n_parallel
                 )
             elif "Sensitivity" in algo_name and "Hybrid" not in algo_name:
                 result_t, final_disp, final_stress = optimize_sensitivity(
                     bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress, tracker
+                    self._log, self._set_progress, tracker, n_parallel=n_parallel
                 )
             elif "SciPy" in algo_name:
                 result_t, final_disp, final_stress = optimize_scipy(
                     bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress, tracker
+                    self._log, self._set_progress, tracker, n_parallel=n_parallel
                 )
             else:
                 result_t, final_disp, final_stress = optimize_hybrid(
                     bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress, tracker
+                    self._log, self._set_progress, tracker, n_parallel=n_parallel
                 )
 
             # Sonuç raporu

@@ -1236,6 +1236,13 @@ class NastranToolApp:
         self.memory_entry.insert(0, "0")
         ttk.Label(param_frame, text="(0 = varsayılan)").grid(row=2, column=2, sticky=tk.W, padx=2, pady=(4, 0))
 
+        ttk.Label(param_frame, text="Total Run:").grid(row=2, column=3, sticky=tk.W, padx=2, pady=(4, 0))
+        self.total_run_var = tk.StringVar(value="-")
+        ttk.Label(param_frame, textvariable=self.total_run_var, width=8,
+                  relief="sunken", anchor=tk.CENTER).grid(row=2, column=4, padx=2, pady=(4, 0))
+        ttk.Button(param_frame, text="Hesapla", width=8,
+                   command=self._calc_total_run).grid(row=2, column=5, padx=2, pady=(4, 0))
+
         ttk.Label(param_frame, text="Algoritma:").grid(row=3, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.algo_var = tk.StringVar()
         algo_combo = ttk.Combobox(param_frame, textvariable=self.algo_var, state="readonly", width=32)
@@ -1336,6 +1343,20 @@ class NastranToolApp:
 
     def _set_progress(self, value):
         self.root.after(0, lambda v=value: self.progress.configure(value=v))
+
+    def _calc_total_run(self):
+        try:
+            min_t = float(self.min_t_entry.get().strip())
+            max_t = float(self.max_t_entry.get().strip())
+            step = float(self.step_entry.get().strip())
+            if step <= 0 or min_t >= max_t:
+                messagebox.showerror("Hata", "Min < Max ve Step > 0 olmalıdır.")
+                return
+            total_run = int(round((max_t - min_t) / step)) + 1
+            self.total_run_var.set(str(total_run))
+            self._log(f"Total Run hesaplandı: {total_run}  (Min={min_t}, Max={max_t}, Step={step})")
+        except ValueError:
+            messagebox.showerror("Hata", "Min T, Max T ve Step sayısal olmalıdır.")
 
     def _validate_common(self):
         bdf_path = self.bdf_entry.get().strip()

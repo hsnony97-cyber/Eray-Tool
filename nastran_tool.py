@@ -839,6 +839,299 @@ def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_ma
 
 
 # ---------------------------------------------------------------------------
+# ALGORİTMA 5: Forward Difference + SciPy SQP (trust-constr)
+# ---------------------------------------------------------------------------
+
+def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                    min_t, max_t, step, max_disp_limit, max_iter,
+                    log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0):
+    """Forward Difference ile gradyan hesaplayıp SciPy trust-constr (SQP) ile optimize eder."""
+    from scipy.optimize import minimize, NonlinearConstraint
+
+    n = len(pids)
+    eval_count = [0]
+    cache = {}
+    log_callback(f"\n  FD + SQP - {n} PSHELL, Paralel: {n_parallel}")
+
+    def _eval_point(x, label_prefix="fd"):
+        """Bir noktayı çözer, cache'e bakar."""
+        key = tuple(round(v, 8) for v in x)
+        if key in cache:
+            return cache[key]
+        eval_count[0] += 1
+        t_map = {pid: float(x[i]) for i, pid in enumerate(pids)}
+        work_dir = os.path.join(output_dir, f"{label_prefix}_eval{eval_count[0]}")
+        try:
+            max_disp, stress_map = solve_and_evaluate(
+                nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb
+            )
+            stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+            tracker.record(f"FD_{eval_count[0]}", t_map, max_disp, max_vm, stress_ok,
+                           allowable_map, log_callback)
+            cache[key] = (max_disp, stress_map)
+            return max_disp, stress_map
+        except Exception as exc:
+            log_callback(f"  Nastran hatası: {exc}")
+            cache[key] = (max_disp_limit * 10, {})
+            return max_disp_limit * 10, {}
+
+    def objective(x):
+        """Amaç: toplam ağırlığı minimize et (proxy: sum of thicknesses)."""
+        return np.sum(x)
+
+    def objective_grad(x):
+        """Gradyan sabit: her kalınlığın ağırlığa katkısı 1."""
+        return np.ones(n)
+
+    def disp_constraint_fun(x):
+        """Displacement constraint: max_disp döndürür."""
+        max_disp, _ = _eval_point(x, "sqp")
+        progress_callback(min(eval_count[0] / max_iter * 100, 99))
+        log_callback(f"  SQP Eval #{eval_count[0]}: sum(t)={np.sum(x):.4f}, disp={max_disp:.6f}")
+        return max_disp
+
+    def disp_constraint_jac(x):
+        """Forward difference ile displacement gradyanı hesaplar."""
+        log_callback(f"  FD gradyan hesaplanıyor...")
+        x0 = np.array(x, dtype=float)
+        f0, _ = _eval_point(x0, "fd_ref")
+
+        if n_parallel > 1:
+            # Paralel FD
+            batch_items = []
+            for i in range(n):
+                x_pert = x0.copy()
+                x_pert[i] += step
+                x_pert[i] = min(x_pert[i], max_t)
+                t_map = {pid: float(x_pert[j]) for j, pid in enumerate(pids)}
+                w_dir = os.path.join(output_dir, f"fd_grad_{eval_count[0]}_p{i}")
+                batch_items.append((t_map, w_dir))
+
+            batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb)
+            grad = np.zeros(n)
+            for i, (_, pert_disp, _) in enumerate(batch_results):
+                grad[i] = (pert_disp - f0) / step
+                log_callback(f"    PID {pids[i]}: dDisp/dT = {grad[i]:.6f}")
+        else:
+            # Seri FD
+            grad = np.zeros(n)
+            for i in range(n):
+                x_pert = x0.copy()
+                x_pert[i] += step
+                x_pert[i] = min(x_pert[i], max_t)
+                fi, _ = _eval_point(x_pert, "fd_pert")
+                grad[i] = (fi - f0) / step
+                log_callback(f"    PID {pids[i]}: dDisp/dT = {grad[i]:.6f}")
+
+        return grad
+
+    x0 = np.full(n, (min_t + max_t) / 2.0)
+    bounds = [(min_t, max_t)] * n
+
+    disp_constr = NonlinearConstraint(
+        disp_constraint_fun, -np.inf, max_disp_limit,
+        jac=disp_constraint_jac
+    )
+
+    log_callback(f"  SQP optimizasyon başlıyor...")
+    result = minimize(
+        objective, x0, method="trust-constr",
+        jac=objective_grad,
+        bounds=bounds,
+        constraints=[disp_constr],
+        options={"maxiter": max_iter, "verbose": 0, "gtol": step / 10},
+    )
+
+    log_callback(f"\n  SQP sonucu: {result.message}")
+    final_t = {pid: round(float(result.x[i]), 8) for i, pid in enumerate(pids)}
+
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, final_t, final_dir, log_callback, memory_mb=memory_mb
+    )
+    stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
+    tracker.record("Final", final_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
+
+    progress_callback(100)
+    return final_t, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
+# ALGORİTMA 6: Genetic Algorithm (GA)
+# ---------------------------------------------------------------------------
+
+def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
+                     min_t, max_t, step, max_disp_limit, max_iter,
+                     log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0):
+    """Genetik Algoritma ile kalınlık optimizasyonu."""
+    n = len(pids)
+    eval_count = [0]
+
+    # GA parametreleri
+    pop_size = max(10, 2 * n)
+    n_generations = max_iter
+    crossover_rate = 0.8
+    mutation_rate = 0.2
+    elite_count = max(2, pop_size // 5)
+
+    log_callback(f"\n  Genetic Algorithm - {n} PSHELL")
+    log_callback(f"  Popülasyon: {pop_size}, Jenerasyon: {n_generations}, Paralel: {n_parallel}")
+    log_callback(f"  Crossover: {crossover_rate}, Mutation: {mutation_rate}, Elite: {elite_count}")
+
+    rng = np.random.RandomState(42)
+
+    def _evaluate_individual(x, gen, idx):
+        """Bir bireyi değerlendir, (mass_proxy, max_disp, stress_ok, stress_map) döndürür."""
+        t_map = {pid: round(float(x[j]), 8) for j, pid in enumerate(pids)}
+        eval_count[0] += 1
+        work_dir = os.path.join(output_dir, f"ga_gen{gen}_ind{idx}")
+        try:
+            max_disp, stress_map = solve_and_evaluate(
+                nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb
+            )
+            stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+            return max_disp, stress_ok, stress_map, max_vm
+        except Exception as exc:
+            log_callback(f"    GA Eval hatası: {exc}")
+            return max_disp_limit * 10, False, {}, 0.0
+
+    def _fitness(x, max_disp, stress_ok):
+        """Fitness: düşük ağırlık + constraint ihlali penaltisi."""
+        weight = np.sum(x)
+        penalty = 0.0
+        if max_disp > max_disp_limit:
+            penalty += 1000.0 * (max_disp - max_disp_limit)
+        if not stress_ok:
+            penalty += 1000.0
+        return weight + penalty
+
+    # İlk popülasyonu oluştur (Latin Hypercube benzeri)
+    population = np.zeros((pop_size, n))
+    for j in range(n):
+        vals = np.linspace(min_t, max_t, pop_size)
+        rng.shuffle(vals)
+        population[:, j] = vals
+
+    best_t = None
+    best_fitness = float('inf')
+    best_disp = float('inf')
+    best_stress = {}
+
+    for gen in range(n_generations):
+        log_callback(f"\n{'='*50}")
+        log_callback(f"GA JENERASYON {gen + 1}/{n_generations}")
+        progress_callback((gen / n_generations) * 100)
+
+        # Popülasyonu değerlendir
+        fitness_scores = np.full(pop_size, float('inf'))
+        disp_results = np.zeros(pop_size)
+        stress_results = [None] * pop_size
+        vm_results = np.zeros(pop_size)
+
+        if n_parallel > 1:
+            # Paralel değerlendirme
+            batch_items = []
+            for i in range(pop_size):
+                t_map = {pid: round(float(population[i, j]), 8) for j, pid in enumerate(pids)}
+                w_dir = os.path.join(output_dir, f"ga_gen{gen}_ind{i}")
+                batch_items.append((t_map, w_dir))
+
+            log_callback(f"  {pop_size} birey paralel değerlendiriliyor...")
+            try:
+                batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb)
+                for i, (t_map, max_disp, stress_map) in enumerate(batch_results):
+                    stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+                    disp_results[i] = max_disp
+                    stress_results[i] = stress_map
+                    vm_results[i] = max_vm
+                    fitness_scores[i] = _fitness(population[i], max_disp, stress_ok)
+
+                    tracker.record(f"GA_G{gen+1}_{i+1}", t_map, max_disp, max_vm, stress_ok,
+                                   allowable_map, log_callback)
+            except Exception as exc:
+                log_callback(f"  Paralel GA hatası: {exc}")
+                continue
+        else:
+            # Seri değerlendirme
+            for i in range(pop_size):
+                max_disp, stress_ok, stress_map, max_vm = _evaluate_individual(population[i], gen, i)
+                disp_results[i] = max_disp
+                stress_results[i] = stress_map
+                vm_results[i] = max_vm
+                fitness_scores[i] = _fitness(population[i], max_disp, stress_ok)
+
+                t_map = {pid: round(float(population[i, j]), 8) for j, pid in enumerate(pids)}
+                tracker.record(f"GA_G{gen+1}_{i+1}", t_map, max_disp, max_vm, stress_ok,
+                               allowable_map, log_callback)
+
+        # En iyi bireyi güncelle
+        gen_best_idx = np.argmin(fitness_scores)
+        if fitness_scores[gen_best_idx] < best_fitness:
+            best_fitness = fitness_scores[gen_best_idx]
+            best_t = {pid: round(float(population[gen_best_idx, j]), 8) for j, pid in enumerate(pids)}
+            best_disp = disp_results[gen_best_idx]
+            best_stress = stress_results[gen_best_idx] if stress_results[gen_best_idx] else {}
+
+        log_callback(f"  En iyi fitness: {fitness_scores[gen_best_idx]:.4f}, "
+                     f"Disp: {disp_results[gen_best_idx]:.6f}, "
+                     f"sum(t): {np.sum(population[gen_best_idx]):.4f}")
+
+        # Yeni popülasyon oluştur
+        sorted_indices = np.argsort(fitness_scores)
+        new_population = np.zeros_like(population)
+
+        # Elitizm: en iyi bireyleri koru
+        for i in range(elite_count):
+            new_population[i] = population[sorted_indices[i]]
+
+        # Crossover ve mutasyon ile kalan bireyleri oluştur
+        for i in range(elite_count, pop_size):
+            # Tournament selection
+            p1_idx = sorted_indices[rng.randint(0, max(pop_size // 2, 2))]
+            p2_idx = sorted_indices[rng.randint(0, max(pop_size // 2, 2))]
+            parent1 = population[p1_idx]
+            parent2 = population[p2_idx]
+
+            # Crossover (BLX-alpha)
+            child = parent1.copy()
+            if rng.random() < crossover_rate:
+                alpha = 0.5
+                for j in range(n):
+                    lo = min(parent1[j], parent2[j])
+                    hi = max(parent1[j], parent2[j])
+                    span = hi - lo
+                    child[j] = rng.uniform(lo - alpha * span, hi + alpha * span)
+
+            # Mutasyon
+            if rng.random() < mutation_rate:
+                mut_idx = rng.randint(0, n)
+                child[mut_idx] += rng.normal(0, (max_t - min_t) * 0.1)
+
+            # Sınırları uygula ve step'e yuvarla
+            child = np.clip(child, min_t, max_t)
+            child = np.round(child / step) * step
+            child = np.clip(child, min_t, max_t)
+            new_population[i] = child
+
+        population = new_population
+
+    if best_t is None:
+        best_t = {pid: round(float(population[0, j]), 8) for j, pid in enumerate(pids)}
+
+    log_callback(f"\n{'='*50}")
+    log_callback("SON ÇÖZÜM")
+    final_dir = os.path.join(output_dir, "final_result")
+    final_disp, final_stress = solve_and_evaluate(
+        nastran_exe, bdf_path, best_t, final_dir, log_callback, memory_mb=memory_mb
+    )
+    stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
+    tracker.record("Final", best_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
+
+    progress_callback(100)
+    return best_t, final_disp, final_stress
+
+
+# ---------------------------------------------------------------------------
 # Ana GUI Uygulaması
 # ---------------------------------------------------------------------------
 
@@ -950,9 +1243,11 @@ class NastranToolApp:
             "Sensitivity-Based",
             "SciPy Minimize (SLSQP)",
             "Hybrid (Bisection + Sensitivity)",
-            "DOE + Surrogate Model (Önerilen)",
+            "DOE + Surrogate Model",
+            "FD + SQP (Forward Difference)",
+            "Genetic Algorithm (GA)",
         )
-        algo_combo.current(3)
+        algo_combo.current(4)
         algo_combo.grid(row=3, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
 
         main_frame.columnconfigure(1, weight=1)
@@ -1189,30 +1484,27 @@ class NastranToolApp:
             )
 
             # Algoritma çalıştır
+            algo_kwargs = dict(
+                bdf_path=bdf_path, nastran_exe=nastran_exe, output_dir=output_dir,
+                pids=pids, allowable_map=allowable_map,
+                min_t=min_t, max_t=max_t, step=step,
+                max_disp_limit=max_disp_limit, max_iter=max_iter,
+                log_callback=self._log, progress_callback=self._set_progress,
+                tracker=tracker, n_parallel=n_parallel, memory_mb=memory_mb,
+            )
+
             if "DOE" in algo_name:
-                result_t, final_disp, final_stress = optimize_doe_surrogate(
-                    bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                    min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress, tracker, n_parallel=n_parallel, memory_mb=memory_mb
-                )
+                result_t, final_disp, final_stress = optimize_doe_surrogate(**algo_kwargs)
+            elif "FD" in algo_name or "SQP" in algo_name:
+                result_t, final_disp, final_stress = optimize_fd_sqp(**algo_kwargs)
+            elif "Genetic" in algo_name or "GA" in algo_name:
+                result_t, final_disp, final_stress = optimize_genetic(**algo_kwargs)
             elif "Sensitivity" in algo_name and "Hybrid" not in algo_name:
-                result_t, final_disp, final_stress = optimize_sensitivity(
-                    bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                    min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress, tracker, n_parallel=n_parallel, memory_mb=memory_mb
-                )
+                result_t, final_disp, final_stress = optimize_sensitivity(**algo_kwargs)
             elif "SciPy" in algo_name:
-                result_t, final_disp, final_stress = optimize_scipy(
-                    bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                    min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress, tracker, n_parallel=n_parallel, memory_mb=memory_mb
-                )
+                result_t, final_disp, final_stress = optimize_scipy(**algo_kwargs)
             else:
-                result_t, final_disp, final_stress = optimize_hybrid(
-                    bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                    min_t, max_t, step, max_disp_limit, max_iter,
-                    self._log, self._set_progress, tracker, n_parallel=n_parallel, memory_mb=memory_mb
-                )
+                result_t, final_disp, final_stress = optimize_hybrid(**algo_kwargs)
 
             # Sonuç raporu
             self._log(f"\n{'='*60}")

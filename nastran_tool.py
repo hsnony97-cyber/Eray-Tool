@@ -434,7 +434,15 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                          log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0):
     n = len(pids)
     log_callback(f"\n  Toplam {n} PSHELL optimize edilecek. (Paralel: {n_parallel})")
-    current_t = {pid: max_t for pid in pids}
+
+    # Başlangıç: min_t ile max_t arasında rastgele dağılım (step'e yuvarlanmış)
+    rng = np.random.RandomState(42)
+    current_t = {}
+    for pid in pids:
+        raw = rng.uniform(min_t, max_t)
+        current_t[pid] = round(round(raw / step) * step, 8)
+        current_t[pid] = max(min_t, min(current_t[pid], max_t))
+    log_callback(f"  Başlangıç: rastgele dağılım [{min_t}, {max_t}], step={step}")
 
     for iteration in range(max_iter):
         log_callback(f"\n{'='*50}")
@@ -451,26 +459,11 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         tracker.record(f"Sens_{iteration}", current_t, ref_disp, max_vm, stress_ok,
                        allowable_map, log_callback)
 
-        if not stress_ok:
-            log_callback(f"  {len(failed)} eleman stress aşıyor, kalınlaştırılıyor...")
-            for eid, vm, allow in failed:
-                for pid in pids:
-                    if current_t[pid] < max_t:
-                        current_t[pid] = min(current_t[pid] + step, max_t)
-            continue
-
-        if ref_disp > max_disp_limit:
-            log_callback("  Displacement limiti aşılıyor!")
-            break
-
         log_callback("  Hassasiyet analizi yapılıyor...")
         sensitivities = {}
 
-        # Pertürbasyon yapılacak PID'leri belirle
-        perturbable_pids = [pid for pid in pids if current_t[pid] > min_t + 1e-9]
-        skip_pids = [pid for pid in pids if current_t[pid] <= min_t + 1e-9]
-        for pid in skip_pids:
-            sensitivities[pid] = float('inf')
+        # Pertürbasyon yapılacak PID'leri belirle (hem azaltma hem artırma mümkün)
+        perturbable_pids = list(pids)
 
         # Paralel pertürbasyon çözümleri
         if perturbable_pids and n_parallel > 1:
@@ -478,6 +471,7 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             for pid in perturbable_pids:
                 perturbed_t = dict(current_t)
                 perturbed_t[pid] = current_t[pid] - step
+                perturbed_t[pid] = max(min_t, perturbed_t[pid])
                 pert_dir = os.path.join(output_dir, f"sens_iter{iteration}_p{pid}")
                 batch_items.append((perturbed_t, pert_dir))
 
@@ -486,12 +480,15 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb)
                 for i, pid in enumerate(perturbable_pids):
                     _, pert_disp, pert_stress = batch_results[i]
-                    sensitivity = (pert_disp - ref_disp) / step
-                    sensitivities[pid] = sensitivity
-
-                    s_ok, _, _ = check_stress_constraints(pert_stress, allowable_map)
-                    if not s_ok:
+                    if abs(current_t[pid] - min_t) < 1e-9:
                         sensitivities[pid] = float('inf')
+                    else:
+                        sensitivity = (pert_disp - ref_disp) / step
+                        sensitivities[pid] = sensitivity
+
+                        s_ok, _, _ = check_stress_constraints(pert_stress, allowable_map)
+                        if not s_ok:
+                            sensitivities[pid] = float('inf')
 
                     log_callback(f"    PID {pid}: dDisp/dT = {sensitivities[pid]:.6f} ({i+1}/{n})")
             except Exception as exc:
@@ -501,8 +498,14 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         else:
             # Seri pertürbasyon çözümleri
             for i, pid in enumerate(perturbable_pids):
+                if abs(current_t[pid] - min_t) < 1e-9:
+                    sensitivities[pid] = float('inf')
+                    log_callback(f"    PID {pid}: min_t'de, atlanıyor ({i+1}/{n})")
+                    continue
+
                 perturbed_t = dict(current_t)
                 perturbed_t[pid] = current_t[pid] - step
+                perturbed_t[pid] = max(min_t, perturbed_t[pid])
 
                 pert_dir = os.path.join(output_dir, f"sens_iter{iteration}_p{pid}")
                 try:
@@ -520,28 +523,49 @@ def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
                 log_callback(f"    PID {pid}: dDisp/dT = {sensitivities[pid]:.6f} ({i+1}/{n})")
 
-        sorted_pids = sorted(
-            [p for p in pids if sensitivities[p] < float('inf')],
-            key=lambda p: abs(sensitivities[p])
-        )
+        # Sensitivity'ye göre kalınlık ayarla
+        valid_pids = [p for p in pids if sensitivities.get(p, float('inf')) < float('inf')]
 
-        if not sorted_pids:
-            log_callback("  Hiçbir PSHELL daha fazla inceltilemez.")
+        if not valid_pids:
+            log_callback("  Hiçbir PSHELL daha fazla ayarlanamaz.")
             break
 
-        n_reduce = max(1, len(sorted_pids) // 2)
-        reduced_any = False
-        for pid in sorted_pids[:n_reduce]:
-            new_val = current_t[pid] - step
-            if new_val >= min_t:
-                current_t[pid] = round(new_val, 8)
-                reduced_any = True
+        if ref_disp <= max_disp_limit and stress_ok:
+            # Feasible: en az hassas olanları azalt (ağırlık düşür)
+            sorted_pids = sorted(valid_pids, key=lambda p: abs(sensitivities[p]))
+            n_reduce = max(1, len(sorted_pids) // 2)
+            reduced_any = False
+            for pid in sorted_pids[:n_reduce]:
+                new_val = current_t[pid] - step
+                if new_val >= min_t:
+                    current_t[pid] = round(new_val, 8)
+                    reduced_any = True
 
-        if not reduced_any:
-            log_callback("  Minimum kalınlığa ulaşıldı.")
-            break
+            if not reduced_any:
+                log_callback("  Minimum kalınlığa ulaşıldı.")
+                break
+            log_callback(f"  Feasible: {n_reduce} PSHELL inceldi (en az hassas olanlar).")
+        else:
+            # Infeasible: en çok hassas olanları artır (constraint'i sağla)
+            sorted_pids = sorted(valid_pids, key=lambda p: abs(sensitivities[p]), reverse=True)
+            n_increase = max(1, len(sorted_pids) // 4)
+            increased_any = False
+            for pid in sorted_pids[:n_increase]:
+                new_val = current_t[pid] + step
+                if new_val <= max_t:
+                    current_t[pid] = round(new_val, 8)
+                    increased_any = True
 
-        log_callback(f"  {n_reduce} PSHELL incelendi.")
+            if not increased_any:
+                log_callback("  Maksimum kalınlığa ulaşıldı, iyileştirme yapılamıyor.")
+                break
+
+            reason = []
+            if ref_disp > max_disp_limit:
+                reason.append(f"disp={ref_disp:.6f}>{max_disp_limit}")
+            if not stress_ok:
+                reason.append(f"{len(failed)} stress fail")
+            log_callback(f"  Infeasible ({', '.join(reason)}): {n_increase} PSHELL kalınlaştırıldı (en hassas olanlar).")
 
     log_callback(f"\n{'='*50}")
     log_callback("SON ÇÖZÜM")

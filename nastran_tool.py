@@ -962,7 +962,8 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
 def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                      min_t, max_t, step, max_disp_limit, max_iter,
-                     log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0):
+                     log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                     pid_mid_map=None, mid_density_map=None, pid_area_map=None):
     """Genetik Algoritma ile kalınlık optimizasyonu."""
     n = len(pids)
     eval_count = [0]
@@ -974,36 +975,36 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     mutation_rate = 0.2
     elite_count = max(2, pop_size // 5)
 
+    # Gerçek kütle hesabı kullanılabilir mi?
+    use_real_mass = (pid_mid_map is not None and mid_density_map is not None
+                     and pid_area_map is not None)
+
     log_callback(f"\n  Genetic Algorithm - {n} PSHELL")
     log_callback(f"  Popülasyon: {pop_size}, Jenerasyon: {n_generations}, Paralel: {n_parallel}")
     log_callback(f"  Crossover: {crossover_rate}, Mutation: {mutation_rate}, Elite: {elite_count}")
+    if use_real_mass:
+        log_callback(f"  Fitness: Gerçek kütle (t x area x density)")
+    else:
+        log_callback(f"  Fitness: sum(thicknesses)")
 
     rng = np.random.RandomState(42)
 
-    def _evaluate_individual(x, gen, idx):
-        """Bir bireyi değerlendir, (mass_proxy, max_disp, stress_ok, stress_map) döndürür."""
-        t_map = {pid: round(float(x[j]), 8) for j, pid in enumerate(pids)}
-        eval_count[0] += 1
-        work_dir = os.path.join(output_dir, f"ga_gen{gen}_ind{idx}")
-        try:
-            max_disp, stress_map = solve_and_evaluate(
-                nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb
-            )
-            stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
-            return max_disp, stress_ok, stress_map, max_vm
-        except Exception as exc:
-            log_callback(f"    GA Eval hatası: {exc}")
-            return max_disp_limit * 10, False, {}, 0.0
+    def _calc_mass(t_map):
+        """Birey için kütle hesabı."""
+        if use_real_mass:
+            mass, _ = compute_real_mass(t_map, pid_mid_map, mid_density_map, pid_area_map)
+            return mass
+        return sum(t_map.values())
 
-    def _fitness(x, max_disp, stress_ok):
-        """Fitness: düşük ağırlık + constraint ihlali penaltisi."""
-        weight = np.sum(x)
+    def _fitness(t_map, max_disp, stress_ok):
+        """Fitness: düşük gerçek kütle + constraint ihlali penaltisi."""
+        mass = _calc_mass(t_map)
         penalty = 0.0
         if max_disp > max_disp_limit:
             penalty += 1000.0 * (max_disp - max_disp_limit)
         if not stress_ok:
             penalty += 1000.0
-        return weight + penalty
+        return mass + penalty
 
     # İlk popülasyonu oluştur (Latin Hypercube benzeri)
     population = np.zeros((pop_size, n))
@@ -1026,15 +1027,21 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         fitness_scores = np.full(pop_size, float('inf'))
         disp_results = np.zeros(pop_size)
         stress_results = [None] * pop_size
+        stress_ok_results = [False] * pop_size
         vm_results = np.zeros(pop_size)
+        mass_results = np.zeros(pop_size)
+        t_maps = [None] * pop_size
+
+        # Her birey için t_map oluştur
+        for i in range(pop_size):
+            t_maps[i] = {pid: round(float(population[i, j]), 8) for j, pid in enumerate(pids)}
 
         if n_parallel > 1:
             # Paralel değerlendirme
             batch_items = []
             for i in range(pop_size):
-                t_map = {pid: round(float(population[i, j]), 8) for j, pid in enumerate(pids)}
                 w_dir = os.path.join(output_dir, f"ga_gen{gen}_ind{i}")
-                batch_items.append((t_map, w_dir))
+                batch_items.append((t_maps[i], w_dir))
 
             log_callback(f"  {pop_size} birey paralel değerlendiriliyor...")
             try:
@@ -1043,10 +1050,12 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
                     disp_results[i] = max_disp
                     stress_results[i] = stress_map
+                    stress_ok_results[i] = stress_ok
                     vm_results[i] = max_vm
-                    fitness_scores[i] = _fitness(population[i], max_disp, stress_ok)
+                    mass_results[i] = _calc_mass(t_maps[i])
+                    fitness_scores[i] = _fitness(t_maps[i], max_disp, stress_ok)
 
-                    tracker.record(f"GA_G{gen+1}_{i+1}", t_map, max_disp, max_vm, stress_ok,
+                    tracker.record(f"GA_G{gen+1}_{i+1}", t_maps[i], max_disp, max_vm, stress_ok,
                                    allowable_map, log_callback)
             except Exception as exc:
                 log_callback(f"  Paralel GA hatası: {exc}")
@@ -1054,27 +1063,54 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         else:
             # Seri değerlendirme
             for i in range(pop_size):
-                max_disp, stress_ok, stress_map, max_vm = _evaluate_individual(population[i], gen, i)
+                eval_count[0] += 1
+                w_dir = os.path.join(output_dir, f"ga_gen{gen}_ind{i}")
+                try:
+                    max_disp, stress_map = solve_and_evaluate(
+                        nastran_exe, bdf_path, t_maps[i], w_dir, log_callback, memory_mb=memory_mb
+                    )
+                    stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+                except Exception as exc:
+                    log_callback(f"    GA Eval hatası: {exc}")
+                    max_disp = max_disp_limit * 10
+                    stress_ok = False
+                    stress_map = {}
+                    max_vm = 0.0
+
                 disp_results[i] = max_disp
                 stress_results[i] = stress_map
+                stress_ok_results[i] = stress_ok
                 vm_results[i] = max_vm
-                fitness_scores[i] = _fitness(population[i], max_disp, stress_ok)
+                mass_results[i] = _calc_mass(t_maps[i])
+                fitness_scores[i] = _fitness(t_maps[i], max_disp, stress_ok)
 
-                t_map = {pid: round(float(population[i, j]), 8) for j, pid in enumerate(pids)}
-                tracker.record(f"GA_G{gen+1}_{i+1}", t_map, max_disp, max_vm, stress_ok,
+                tracker.record(f"GA_G{gen+1}_{i+1}", t_maps[i], max_disp, max_vm, stress_ok,
                                allowable_map, log_callback)
 
-        # En iyi bireyi güncelle
+        # ---- Jenerasyon Özeti (satır satır) ----
+        log_callback(f"\n  --- Gen {gen + 1} Özet ---")
+        mass_unit = "kg" if use_real_mass else "sum(t)"
+        log_callback(f"  {'No':>4}  {'Mass':>12}  {'Max Disp':>12}  {'Stress':>8}  {'Feasible':>8}")
+        log_callback(f"  {'----':>4}  {'--------':>12}  {'--------':>12}  {'------':>8}  {'--------':>8}")
+        for i in range(pop_size):
+            feasible = "OK" if (disp_results[i] <= max_disp_limit and stress_ok_results[i]) else "FAIL"
+            log_callback(f"  {i+1:>4}  {mass_results[i]:>12.4f}  {disp_results[i]:>12.6f}  {vm_results[i]:>8.1f}  {feasible:>8}")
+
+        # En iyi bireyi güncelle (feasible + en hafif gerçek kütle)
         gen_best_idx = np.argmin(fitness_scores)
         if fitness_scores[gen_best_idx] < best_fitness:
             best_fitness = fitness_scores[gen_best_idx]
-            best_t = {pid: round(float(population[gen_best_idx, j]), 8) for j, pid in enumerate(pids)}
+            best_t = dict(t_maps[gen_best_idx])
             best_disp = disp_results[gen_best_idx]
             best_stress = stress_results[gen_best_idx] if stress_results[gen_best_idx] else {}
 
-        log_callback(f"  En iyi fitness: {fitness_scores[gen_best_idx]:.4f}, "
-                     f"Disp: {disp_results[gen_best_idx]:.6f}, "
-                     f"sum(t): {np.sum(population[gen_best_idx]):.4f}")
+        gen_best_mass = mass_results[gen_best_idx]
+        gen_feasible_count = sum(1 for i in range(pop_size)
+                                 if disp_results[i] <= max_disp_limit and stress_ok_results[i])
+        log_callback(f"\n  Gen {gen+1} en iyi: Birey #{gen_best_idx+1}, "
+                     f"Mass={gen_best_mass:.4f} {mass_unit}, "
+                     f"Disp={disp_results[gen_best_idx]:.6f}")
+        log_callback(f"  Feasible birey: {gen_feasible_count}/{pop_size}")
 
         # Yeni popülasyon oluştur
         sorted_indices = np.argsort(fitness_scores)
@@ -1610,6 +1646,9 @@ class NastranToolApp:
             elif "FD" in algo_name or "SQP" in algo_name:
                 result_t, final_disp, final_stress = optimize_fd_sqp(**algo_kwargs)
             elif "Genetic" in algo_name or "GA" in algo_name:
+                algo_kwargs["pid_mid_map"] = pid_mid_map
+                algo_kwargs["mid_density_map"] = mid_density_map
+                algo_kwargs["pid_area_map"] = pid_area_map
                 result_t, final_disp, final_stress = optimize_genetic(**algo_kwargs)
             elif "Sensitivity" in algo_name and "Hybrid" not in algo_name:
                 result_t, final_disp, final_stress = optimize_sensitivity(**algo_kwargs)

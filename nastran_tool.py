@@ -64,6 +64,8 @@ def read_bdf_model(bdf_path):
         pid_mid_map: {pid: mid} PSHELL -> malzeme eşlemesi
         mid_density_map: {mid: rho} malzeme density
         pid_area_map: {pid: total_area} her PSHELL'e ait elemanların toplam alanı
+        eid_pid_map: {eid: pid} eleman -> property eşlemesi
+        eid_area_map: {eid: area} eleman alanları
     """
     model = BDF()
     model.read_bdf(bdf_path, xref=True)
@@ -72,6 +74,8 @@ def read_bdf_model(bdf_path):
     pid_mid_map = {}
     mid_density_map = {}
     pid_area_map = {}
+    eid_pid_map = {}
+    eid_area_map = {}
 
     # PSHELL kartlarını oku
     for pid, prop in model.properties.items():
@@ -92,14 +96,16 @@ def read_bdf_model(bdf_path):
     for eid, elem in model.elements.items():
         if elem.type in ("CQUAD4", "CTRIA3", "CQUAD8", "CTRIA6"):
             elem_pid = elem.pid
+            eid_pid_map[eid] = elem_pid
             if elem_pid in pid_area_map:
                 try:
                     area = elem.Area()
                     pid_area_map[elem_pid] += area
+                    eid_area_map[eid] = area
                 except Exception:
                     pass
 
-    return pids, pid_mid_map, mid_density_map, pid_area_map
+    return pids, pid_mid_map, mid_density_map, pid_area_map, eid_pid_map, eid_area_map
 
 
 def compute_real_mass(thickness_map, pid_mid_map, mid_density_map, pid_area_map):
@@ -318,6 +324,78 @@ def check_stress_constraints(stress_map, allowable_map):
     return len(failed) == 0, failed, max_vm
 
 
+def compute_average_stress_per_pid(stress_map, eid_pid_map, eid_area_map, sigma_count=1):
+    """Her property icin agirlikli ortalama stress ve sigma hesaplar.
+    avg_stress = sum(stress_i * area_i) / sum(area_i)
+    sigma = sqrt(sum(area_i * (stress_i - avg)^2) / sum(area_i))
+    Returns: {pid: (avg_stress, sigma, avg+n*sigma, max_stress)}
+    """
+    # PID bazli eleman gruplama
+    pid_elements = {}  # {pid: [(stress, area), ...]}
+    for eid, stress in stress_map.items():
+        pid = eid_pid_map.get(eid)
+        if pid is None:
+            continue
+        area = eid_area_map.get(eid, 0.0)
+        if area <= 0:
+            continue
+        if pid not in pid_elements:
+            pid_elements[pid] = []
+        pid_elements[pid].append((stress, area))
+
+    result = {}
+    for pid, elems in pid_elements.items():
+        total_area = sum(a for _, a in elems)
+        if total_area <= 0:
+            continue
+
+        # Agirlikli ortalama
+        avg = sum(s * a for s, a in elems) / total_area
+
+        # Agirlikli standart sapma (sigma)
+        variance = sum(a * (s - avg) ** 2 for s, a in elems) / total_area
+        sigma = variance ** 0.5
+
+        # Property'deki max stress
+        max_stress = max(s for s, _ in elems)
+
+        # avg + n*sigma (max_stress'i asamaz)
+        avg_plus_sigma = avg + sigma_count * sigma
+        effective_stress = min(avg_plus_sigma, max_stress)
+
+        result[pid] = (avg, sigma, effective_stress, max_stress)
+
+    return result
+
+
+def do_stress_check(stress_map, allowable_map, stress_mode, sigma_count,
+                    eid_pid_map, eid_area_map):
+    """Stress moduna gore uygun stress kontrolu yapar.
+    Returns: (stress_ok, failed, max_vm)
+    """
+    if stress_mode == "Average Stress" and eid_pid_map and eid_area_map:
+        avg_data = compute_average_stress_per_pid(stress_map, eid_pid_map, eid_area_map, sigma_count)
+        return check_stress_constraints_average(avg_data, allowable_map)
+    else:
+        return check_stress_constraints(stress_map, allowable_map)
+
+
+def check_stress_constraints_average(avg_stress_data, prop_allowable_map):
+    """Average stress modunda property bazli stress kontrolu.
+    avg_stress_data: {pid: (avg, sigma, effective_stress, max_stress)}
+    prop_allowable_map: {pid: allowable}
+    Returns: (all_ok, failed_list, max_effective_stress)
+    """
+    failed = []
+    max_eff = 0.0
+    for pid, (avg, sigma, eff_stress, max_stress) in avg_stress_data.items():
+        if eff_stress > max_eff:
+            max_eff = eff_stress
+        if pid in prop_allowable_map and eff_stress > prop_allowable_map[pid]:
+            failed.append((pid, eff_stress, prop_allowable_map[pid]))
+    return len(failed) == 0, failed, max_eff
+
+
 def log_mass_summary(total_mass, max_disp, max_disp_limit, max_vm, stress_ok, log_callback):
     """Mass Summary: toplam mass, max displacement, max stress"""
     disp_status = "OK" if max_disp <= max_disp_limit else "FAIL"
@@ -446,7 +524,8 @@ class IterationTracker:
 def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
                     log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
-                    pid_bounds=None):
+                    pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                    eid_pid_map=None, eid_area_map=None):
     """Forward Difference ile gradyan hesaplayıp SciPy trust-constr (SQP) ile optimize eder."""
     from scipy.optimize import minimize, NonlinearConstraint
 
@@ -479,7 +558,9 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             max_disp, stress_map = solve_and_evaluate(
                 nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb
             )
-            stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+            stress_ok, _, max_vm = do_stress_check(
+                stress_map, allowable_map, stress_mode, sigma_count,
+                eid_pid_map, eid_area_map)
             tracker.record(f"FD_{eval_count[0]}", t_map, max_disp, max_vm, stress_ok,
                            allowable_map, log_callback)
             cache[key] = (max_disp, stress_map)
@@ -563,7 +644,9 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     final_disp, final_stress = solve_and_evaluate(
         nastran_exe, bdf_path, final_t, final_dir, log_callback, memory_mb=memory_mb
     )
-    stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
     tracker.record("Final", final_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
 
     progress_callback(100)
@@ -578,7 +661,8 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                      min_t, max_t, step, max_disp_limit, max_iter,
                      log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
                      pid_mid_map=None, mid_density_map=None, pid_area_map=None,
-                     pid_bounds=None):
+                     pid_bounds=None, stress_mode="Element Based", sigma_count=0,
+                     eid_pid_map=None, eid_area_map=None):
     """Genetik Algoritma ile kalınlık optimizasyonu."""
     n = len(pids)
     eval_count = [0]
@@ -673,7 +757,9 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             try:
                 batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb)
                 for i, (t_map, max_disp, stress_map) in enumerate(batch_results):
-                    stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+                    stress_ok, _, max_vm = do_stress_check(
+                        stress_map, allowable_map, stress_mode, sigma_count,
+                        eid_pid_map, eid_area_map)
                     disp_results[i] = max_disp
                     stress_results[i] = stress_map
                     stress_ok_results[i] = stress_ok
@@ -695,7 +781,9 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     max_disp, stress_map = solve_and_evaluate(
                         nastran_exe, bdf_path, t_maps[i], w_dir, log_callback, memory_mb=memory_mb
                     )
-                    stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
+                    stress_ok, _, max_vm = do_stress_check(
+                        stress_map, allowable_map, stress_mode, sigma_count,
+                        eid_pid_map, eid_area_map)
                 except Exception as exc:
                     log_callback(f"    GA Eval hatası: {exc}")
                     max_disp = max_disp_limit * 10
@@ -786,7 +874,9 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     final_disp, final_stress = solve_and_evaluate(
         nastran_exe, bdf_path, best_t, final_dir, log_callback, memory_mb=memory_mb
     )
-    stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
+    stress_ok, _, max_vm = do_stress_check(
+        final_stress, allowable_map, stress_mode, sigma_count,
+        eid_pid_map, eid_area_map)
     tracker.record("Final", best_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
 
     progress_callback(100)
@@ -998,6 +1088,31 @@ class NastranToolApp:
         retain_combo.current(2)
         retain_combo.grid(row=4, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
 
+        # Stress modu
+        ttk.Label(param_frame, text="Stress Modu:").grid(row=5, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.stress_mode_var = tk.StringVar()
+        stress_combo = ttk.Combobox(param_frame, textvariable=self.stress_mode_var, state="readonly", width=32)
+        stress_combo["values"] = (
+            "Element Based",
+            "Average Stress",
+        )
+        stress_combo.current(0)
+        stress_combo.grid(row=5, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
+        stress_combo.bind("<<ComboboxSelected>>", self._on_stress_mode_changed)
+
+        # Sigma secimi (sadece average modda aktif)
+        ttk.Label(param_frame, text="Sigma:").grid(row=6, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.sigma_var = tk.IntVar(value=1)
+        self.sigma_frame = ttk.Frame(param_frame)
+        self.sigma_frame.grid(row=6, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
+        self.sigma_1_btn = ttk.Radiobutton(self.sigma_frame, text="1 Sigma", variable=self.sigma_var, value=1)
+        self.sigma_1_btn.pack(side=tk.LEFT, padx=4)
+        self.sigma_2_btn = ttk.Radiobutton(self.sigma_frame, text="2 Sigma", variable=self.sigma_var, value=2)
+        self.sigma_2_btn.pack(side=tk.LEFT, padx=4)
+        # Baslangicta devre disi (element based modda sigma kullanilmaz)
+        self.sigma_1_btn.configure(state=tk.DISABLED)
+        self.sigma_2_btn.configure(state=tk.DISABLED)
+
         main_frame.columnconfigure(1, weight=1)
 
         # Butonlar
@@ -1048,6 +1163,15 @@ class NastranToolApp:
         self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.canvas.draw()
+
+    def _on_stress_mode_changed(self, event=None):
+        """Stress modu degistiginde sigma butonlarini aktif/deaktif yap."""
+        if self.stress_mode_var.get() == "Average Stress":
+            self.sigma_1_btn.configure(state=tk.NORMAL)
+            self.sigma_2_btn.configure(state=tk.NORMAL)
+        else:
+            self.sigma_1_btn.configure(state=tk.DISABLED)
+            self.sigma_2_btn.configure(state=tk.DISABLED)
 
     def _toggle_excel_thickness(self):
         """Excel'den Thickness Range okuma modunu aç/kapat."""
@@ -1139,7 +1263,7 @@ class NastranToolApp:
         # BDF'den PSHELL sayısını oku
         try:
             self._log("BDF okunuyor (PSHELL sayısı için)...")
-            pids, _, _, _ = read_bdf_model(bdf_path)
+            pids, _, _, _, _, _ = read_bdf_model(bdf_path)
             n_pids = len(pids)
             if n_pids == 0:
                 messagebox.showerror("Hata", "BDF dosyasında PSHELL bulunamadı.")
@@ -1236,7 +1360,7 @@ class NastranToolApp:
 
             # BDF'den mass bilgisi
             self._log("\nBDF okunuyor (mass hesabı)...")
-            pids, pid_mid_map, mid_density_map, pid_area_map = read_bdf_model(bdf_path)
+            pids, pid_mid_map, mid_density_map, pid_area_map, _, _ = read_bdf_model(bdf_path)
             # Mevcut kalınlıkları oku
             bdf_model = BDF()
             bdf_model.read_bdf(bdf_path, xref=False)
@@ -1310,6 +1434,9 @@ class NastranToolApp:
         else:
             retain_mode = "all"
 
+        stress_mode = self.stress_mode_var.get()
+        sigma_count = self.sigma_var.get() if stress_mode == "Average Stress" else 0
+
         self._disable_buttons()
         self.progress.configure(mode="determinate", value=0)
 
@@ -1317,13 +1444,14 @@ class NastranToolApp:
             target=self._opt_worker,
             args=(bdf_path, nastran_exe, output_dir, excel_path,
                   min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
-                  retain_mode, thickness_range_data),
+                  retain_mode, thickness_range_data, stress_mode, sigma_count),
             daemon=True,
         ).start()
 
     def _opt_worker(self, bdf_path, nastran_exe, output_dir, excel_path,
                     min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
-                    retain_mode="all", thickness_range_data=None):
+                    retain_mode="all", thickness_range_data=None,
+                    stress_mode="Element Based", sigma_count=0):
         try:
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
@@ -1336,7 +1464,7 @@ class NastranToolApp:
 
             # BDF'den PSHELL, malzeme ve alan bilgisi oku
             self._log("\nBDF modeli okunuyor...")
-            pids, pid_mid_map, mid_density_map, pid_area_map = read_bdf_model(bdf_path)
+            pids, pid_mid_map, mid_density_map, pid_area_map, eid_pid_map, eid_area_map = read_bdf_model(bdf_path)
             if not pids:
                 raise ValueError("BDF dosyasında PSHELL kartı bulunamadı!")
             self._log(f"  {len(pids)} PSHELL bulundu")
@@ -1363,8 +1491,17 @@ class NastranToolApp:
             else:
                 pid_bounds = {pid: (min_t, max_t, step) for pid in pids}
 
-            allowable_map = load_allowable_excel(excel_path)
-            self._log(f"  {len(allowable_map)} element allowable yüklendi.")
+            # Stress moduna gore allowable yukle
+            self._log(f"  Stress modu: {stress_mode}" + (f" ({sigma_count} sigma)" if stress_mode == "Average Stress" else ""))
+            if stress_mode == "Average Stress":
+                prop_allowable_map = load_allowable_excel(excel_path, sheet_name="Stress Allowable(Prop Based)")
+                self._log(f"  {len(prop_allowable_map)} property allowable yuklendi (Prop Based).")
+                # Element-based allowable da gerekli (algoritmalar icin)
+                allowable_map = prop_allowable_map
+            else:
+                allowable_map = load_allowable_excel(excel_path, sheet_name="Stress Allowable(Element Based)")
+                self._log(f"  {len(allowable_map)} element allowable yuklendi (Element Based).")
+                prop_allowable_map = None
 
             # Tracker oluştur
             tracker = IterationTracker(
@@ -1381,6 +1518,8 @@ class NastranToolApp:
                 log_callback=self._log, progress_callback=self._set_progress,
                 tracker=tracker, n_parallel=n_parallel, memory_mb=memory_mb,
                 pid_bounds=pid_bounds,
+                stress_mode=stress_mode, sigma_count=sigma_count,
+                eid_pid_map=eid_pid_map, eid_area_map=eid_area_map,
             )
 
             if "FD" in algo_name or "SQP" in algo_name:
@@ -1394,7 +1533,25 @@ class NastranToolApp:
             # Sonuç raporu
             self._log(f"\n{'='*60}")
             self._log("OPTİMİZASYON SONUÇLARI")
-            stress_ok, failed, max_vm = check_stress_constraints(final_stress, allowable_map)
+
+            if stress_mode == "Average Stress":
+                avg_stress_data = compute_average_stress_per_pid(
+                    final_stress, eid_pid_map, eid_area_map, sigma_count
+                )
+                stress_ok, failed, max_vm = check_stress_constraints_average(
+                    avg_stress_data, prop_allowable_map
+                )
+                # Average stress detaylarini logla
+                self._log(f"\n  Average Stress Sonuclari ({sigma_count} sigma):")
+                self._log(f"  {'PID':>6}  {'Avg':>10}  {'Sigma':>10}  {'Avg+nS':>10}  {'MaxStr':>10}  {'Allow':>10}  {'Durum':>6}")
+                for pid in sorted(avg_stress_data.keys()):
+                    avg, sig, eff, mx = avg_stress_data[pid]
+                    allow = prop_allowable_map.get(pid, 0)
+                    status = "OK" if eff <= allow else "FAIL"
+                    self._log(f"  {pid:>6}  {avg:>10.2f}  {sig:>10.2f}  {eff:>10.2f}  {mx:>10.2f}  {allow:>10.2f}  {status:>6}")
+            else:
+                stress_ok, failed, max_vm = check_stress_constraints(final_stress, allowable_map)
+
             total_mass, pid_mass = compute_real_mass(
                 result_t, pid_mid_map, mid_density_map, pid_area_map
             )

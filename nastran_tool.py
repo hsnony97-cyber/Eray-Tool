@@ -1102,14 +1102,17 @@ class NastranToolApp:
 
         # Sigma secimi (sadece average modda aktif)
         ttk.Label(param_frame, text="Sigma:").grid(row=6, column=0, sticky=tk.W, padx=2, pady=(4, 0))
-        self.sigma_var = tk.IntVar(value=1)
+        self.sigma_var = tk.IntVar(value=0)
         self.sigma_frame = ttk.Frame(param_frame)
         self.sigma_frame.grid(row=6, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
+        self.sigma_avg_btn = ttk.Radiobutton(self.sigma_frame, text="Average", variable=self.sigma_var, value=0)
+        self.sigma_avg_btn.pack(side=tk.LEFT, padx=4)
         self.sigma_1_btn = ttk.Radiobutton(self.sigma_frame, text="1 Sigma", variable=self.sigma_var, value=1)
         self.sigma_1_btn.pack(side=tk.LEFT, padx=4)
         self.sigma_2_btn = ttk.Radiobutton(self.sigma_frame, text="2 Sigma", variable=self.sigma_var, value=2)
         self.sigma_2_btn.pack(side=tk.LEFT, padx=4)
         # Baslangicta devre disi (element based modda sigma kullanilmaz)
+        self.sigma_avg_btn.configure(state=tk.DISABLED)
         self.sigma_1_btn.configure(state=tk.DISABLED)
         self.sigma_2_btn.configure(state=tk.DISABLED)
 
@@ -1167,9 +1170,11 @@ class NastranToolApp:
     def _on_stress_mode_changed(self, event=None):
         """Stress modu degistiginde sigma butonlarini aktif/deaktif yap."""
         if self.stress_mode_var.get() == "Average Stress":
+            self.sigma_avg_btn.configure(state=tk.NORMAL)
             self.sigma_1_btn.configure(state=tk.NORMAL)
             self.sigma_2_btn.configure(state=tk.NORMAL)
         else:
+            self.sigma_avg_btn.configure(state=tk.DISABLED)
             self.sigma_1_btn.configure(state=tk.DISABLED)
             self.sigma_2_btn.configure(state=tk.DISABLED)
 
@@ -1492,7 +1497,11 @@ class NastranToolApp:
                 pid_bounds = {pid: (min_t, max_t, step) for pid in pids}
 
             # Stress moduna gore allowable yukle
-            self._log(f"  Stress modu: {stress_mode}" + (f" ({sigma_count} sigma)" if stress_mode == "Average Stress" else ""))
+            if stress_mode == "Average Stress":
+                sigma_label = "Average (sigma yok)" if sigma_count == 0 else f"{sigma_count} sigma"
+                self._log(f"  Stress modu: {stress_mode} ({sigma_label})")
+            else:
+                self._log(f"  Stress modu: {stress_mode}")
             if stress_mode == "Average Stress":
                 prop_allowable_map = load_allowable_excel(excel_path, sheet_name="Stress Allowable(Prop Based)")
                 self._log(f"  {len(prop_allowable_map)} property allowable yuklendi (Prop Based).")
@@ -1542,7 +1551,8 @@ class NastranToolApp:
                     avg_stress_data, prop_allowable_map
                 )
                 # Average stress detaylarini logla
-                self._log(f"\n  Average Stress Sonuclari ({sigma_count} sigma):")
+                sigma_label = "Average (sigma yok)" if sigma_count == 0 else f"{sigma_count} sigma"
+                self._log(f"\n  Average Stress Sonuclari ({sigma_label}):")
                 self._log(f"  {'PID':>6}  {'Avg':>10}  {'Sigma':>10}  {'Avg+nS':>10}  {'MaxStr':>10}  {'Allow':>10}  {'Durum':>6}")
                 for pid in sorted(avg_stress_data.keys()):
                     avg, sig, eff, mx = avg_stress_data[pid]

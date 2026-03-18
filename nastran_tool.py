@@ -753,6 +753,70 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
 
 # ---------------------------------------------------------------------------
+# Çıktı dosyası temizleme (saklama moduna göre)
+# ---------------------------------------------------------------------------
+
+def cleanup_iteration_outputs(output_dir, retain_mode, tracker, max_disp_limit,
+                              allowable_map, log_callback):
+    """Saklama moduna göre iterasyon çıktılarını temizler.
+    retain_mode:
+      'all'      - Hiçbir şey silme
+      'feasible' - Sadece kısıtları sağlayan iterasyonların dosyalarını tut
+      'optimum'  - Sadece en iyi (en düşük mass, feasible) sonucu tut
+    """
+    import shutil
+
+    if retain_mode == "all":
+        return
+
+    # Çıktı dizinindeki alt klasörleri listele (final_result hariç)
+    subdirs = []
+    for item in os.listdir(output_dir):
+        item_path = os.path.join(output_dir, item)
+        if os.path.isdir(item_path) and item != "final_result":
+            subdirs.append(item_path)
+
+    if retain_mode == "optimum":
+        # final_result dışındaki tüm alt klasörleri sil
+        deleted = 0
+        for d in subdirs:
+            try:
+                shutil.rmtree(d)
+                deleted += 1
+            except OSError:
+                pass
+        if deleted:
+            log_callback(f"  {deleted} ara iterasyon klasoru silindi (sadece en optimum sonuc saklandi).")
+
+    elif retain_mode == "feasible":
+        # Tracker'daki feasible olmayan iterasyonlara ait klasorleri sil
+        feasible_indices = set()
+        for i in range(len(tracker.iterations)):
+            disp = tracker.displacements[i]
+            if disp <= max_disp_limit:
+                feasible_indices.add(i)
+
+        deleted = 0
+        for d in subdirs:
+            dirname = os.path.basename(d)
+            # Iterasyon numarasini dirname'den cikar
+            keep = False
+            for idx in feasible_indices:
+                iter_num = idx + 1
+                if str(iter_num) in dirname:
+                    keep = True
+                    break
+            if not keep:
+                try:
+                    shutil.rmtree(d)
+                    deleted += 1
+                except OSError:
+                    pass
+        if deleted:
+            log_callback(f"  {deleted} ara iterasyon klasoru silindi (sadece feasible sonuclar saklandi).")
+
+
+# ---------------------------------------------------------------------------
 # Ana GUI Uygulaması
 # ---------------------------------------------------------------------------
 
@@ -873,6 +937,17 @@ class NastranToolApp:
         )
         algo_combo.current(0)
         algo_combo.grid(row=3, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
+
+        ttk.Label(param_frame, text="Sonuç Saklama:").grid(row=4, column=0, sticky=tk.W, padx=2, pady=(4, 0))
+        self.output_retain_var = tk.StringVar()
+        retain_combo = ttk.Combobox(param_frame, textvariable=self.output_retain_var, state="readonly", width=32)
+        retain_combo["values"] = (
+            "Sadece En Optimum Sonuc",
+            "Kriterleri Saglayan Sonuclar",
+            "Butun Sonuclar",
+        )
+        retain_combo.current(2)
+        retain_combo.grid(row=4, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
 
         main_frame.columnconfigure(1, weight=1)
 
@@ -1135,18 +1210,29 @@ class NastranToolApp:
             return
 
         algo_name = self.algo_var.get()
+
+        retain_text = self.output_retain_var.get()
+        if "Optimum" in retain_text:
+            retain_mode = "optimum"
+        elif "Kriterleri" in retain_text:
+            retain_mode = "feasible"
+        else:
+            retain_mode = "all"
+
         self._disable_buttons()
         self.progress.configure(mode="determinate", value=0)
 
         threading.Thread(
             target=self._opt_worker,
             args=(bdf_path, nastran_exe, output_dir, excel_path,
-                  min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb),
+                  min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
+                  retain_mode),
             daemon=True,
         ).start()
 
     def _opt_worker(self, bdf_path, nastran_exe, output_dir, excel_path,
-                    min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb):
+                    min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
+                    retain_mode="all"):
         try:
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
@@ -1226,6 +1312,12 @@ class NastranToolApp:
 
             # Grafiği kaydet
             self.fig.savefig(os.path.join(output_dir, "optimization_plot.png"), dpi=150)
+
+            # Çıktı dosyalarını saklama moduna göre temizle
+            cleanup_iteration_outputs(
+                output_dir, retain_mode, tracker, max_disp_limit,
+                allowable_map, self._log
+            )
 
             self._log("\nİŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo(

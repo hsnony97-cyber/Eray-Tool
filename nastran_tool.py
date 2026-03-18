@@ -5,10 +5,8 @@ BDF dosyasındaki PSHELL'lerin kalınlıklarını bağımsız olarak optimize ed
 Amaç: Minimum ağırlık ile displacement ve stress sınırlarını sağlamak.
 
 Algoritmalar:
-  1) Sensitivity-Based
-  2) SciPy Minimize (SLSQP)
-  3) Hybrid (Bisection + Sensitivity)
-  4) DOE + Surrogate Model
+  1) FD + SQP (Forward Difference)
+  2) Genetic Algorithm (GA)
 """
 
 import os
@@ -426,444 +424,7 @@ class IterationTracker:
 
 
 # ---------------------------------------------------------------------------
-# ALGORİTMA 1: Sensitivity-Based
-# ---------------------------------------------------------------------------
-
-def optimize_sensitivity(bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                         min_t, max_t, step, max_disp_limit, max_iter,
-                         log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0):
-    n = len(pids)
-    log_callback(f"\n  Toplam {n} PSHELL optimize edilecek. (Paralel: {n_parallel})")
-
-    # Başlangıç: min_t ile max_t arasında rastgele dağılım (step'e yuvarlanmış)
-    rng = np.random.RandomState(42)
-    current_t = {}
-    for pid in pids:
-        raw = rng.uniform(min_t, max_t)
-        current_t[pid] = round(round(raw / step) * step, 8)
-        current_t[pid] = max(min_t, min(current_t[pid], max_t))
-    log_callback(f"  Başlangıç: rastgele dağılım [{min_t}, {max_t}], step={step}")
-
-    for iteration in range(max_iter):
-        log_callback(f"\n{'='*50}")
-        log_callback(f"SENSITIVITY İTERASYON {iteration + 1}/{max_iter}")
-        progress_callback((iteration / max_iter) * 100)
-
-        ref_dir = os.path.join(output_dir, f"sens_iter{iteration}_ref")
-        log_callback("  Referans çözüm...")
-        ref_disp, ref_stress = solve_and_evaluate(
-            nastran_exe, bdf_path, current_t, ref_dir, log_callback, memory_mb=memory_mb
-        )
-
-        stress_ok, failed, max_vm = check_stress_constraints(ref_stress, allowable_map)
-        tracker.record(f"Sens_{iteration}", current_t, ref_disp, max_vm, stress_ok,
-                       allowable_map, log_callback)
-
-        log_callback("  Hassasiyet analizi yapılıyor...")
-        sensitivities = {}
-
-        # Pertürbasyon yapılacak PID'leri belirle (hem azaltma hem artırma mümkün)
-        perturbable_pids = list(pids)
-
-        # Paralel pertürbasyon çözümleri
-        if perturbable_pids and n_parallel > 1:
-            batch_items = []
-            for pid in perturbable_pids:
-                perturbed_t = dict(current_t)
-                perturbed_t[pid] = current_t[pid] - step
-                perturbed_t[pid] = max(min_t, perturbed_t[pid])
-                pert_dir = os.path.join(output_dir, f"sens_iter{iteration}_p{pid}")
-                batch_items.append((perturbed_t, pert_dir))
-
-            log_callback(f"  {len(batch_items)} pertürbasyon paralel çözülüyor ({n_parallel} worker)...")
-            try:
-                batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb)
-                for i, pid in enumerate(perturbable_pids):
-                    _, pert_disp, pert_stress = batch_results[i]
-                    if abs(current_t[pid] - min_t) < 1e-9:
-                        sensitivities[pid] = float('inf')
-                    else:
-                        sensitivity = (pert_disp - ref_disp) / step
-                        sensitivities[pid] = sensitivity
-
-                        s_ok, _, _ = check_stress_constraints(pert_stress, allowable_map)
-                        if not s_ok:
-                            sensitivities[pid] = float('inf')
-
-                    log_callback(f"    PID {pid}: dDisp/dT = {sensitivities[pid]:.6f} ({i+1}/{n})")
-            except Exception as exc:
-                log_callback(f"  Paralel çözüm hatası: {exc}")
-                for pid in perturbable_pids:
-                    sensitivities[pid] = float('inf')
-        else:
-            # Seri pertürbasyon çözümleri
-            for i, pid in enumerate(perturbable_pids):
-                if abs(current_t[pid] - min_t) < 1e-9:
-                    sensitivities[pid] = float('inf')
-                    log_callback(f"    PID {pid}: min_t'de, atlanıyor ({i+1}/{n})")
-                    continue
-
-                perturbed_t = dict(current_t)
-                perturbed_t[pid] = current_t[pid] - step
-                perturbed_t[pid] = max(min_t, perturbed_t[pid])
-
-                pert_dir = os.path.join(output_dir, f"sens_iter{iteration}_p{pid}")
-                try:
-                    pert_disp, pert_stress = solve_and_evaluate(
-                        nastran_exe, bdf_path, perturbed_t, pert_dir, log_callback, memory_mb=memory_mb
-                    )
-                    sensitivity = (pert_disp - ref_disp) / step
-                    sensitivities[pid] = sensitivity
-
-                    s_ok, _, _ = check_stress_constraints(pert_stress, allowable_map)
-                    if not s_ok:
-                        sensitivities[pid] = float('inf')
-                except Exception:
-                    sensitivities[pid] = float('inf')
-
-                log_callback(f"    PID {pid}: dDisp/dT = {sensitivities[pid]:.6f} ({i+1}/{n})")
-
-        # Sensitivity'ye göre kalınlık ayarla
-        valid_pids = [p for p in pids if sensitivities.get(p, float('inf')) < float('inf')]
-
-        if not valid_pids:
-            log_callback("  Hiçbir PSHELL daha fazla ayarlanamaz.")
-            break
-
-        if ref_disp <= max_disp_limit and stress_ok:
-            # Feasible: en az hassas olanları azalt (ağırlık düşür)
-            sorted_pids = sorted(valid_pids, key=lambda p: abs(sensitivities[p]))
-            n_reduce = max(1, len(sorted_pids) // 2)
-            reduced_any = False
-            for pid in sorted_pids[:n_reduce]:
-                new_val = current_t[pid] - step
-                if new_val >= min_t:
-                    current_t[pid] = round(new_val, 8)
-                    reduced_any = True
-
-            if not reduced_any:
-                log_callback("  Minimum kalınlığa ulaşıldı.")
-                break
-            log_callback(f"  Feasible: {n_reduce} PSHELL inceldi (en az hassas olanlar).")
-        else:
-            # Infeasible: en çok hassas olanları artır (constraint'i sağla)
-            sorted_pids = sorted(valid_pids, key=lambda p: abs(sensitivities[p]), reverse=True)
-            n_increase = max(1, len(sorted_pids) // 4)
-            increased_any = False
-            for pid in sorted_pids[:n_increase]:
-                new_val = current_t[pid] + step
-                if new_val <= max_t:
-                    current_t[pid] = round(new_val, 8)
-                    increased_any = True
-
-            if not increased_any:
-                log_callback("  Maksimum kalınlığa ulaşıldı, iyileştirme yapılamıyor.")
-                break
-
-            reason = []
-            if ref_disp > max_disp_limit:
-                reason.append(f"disp={ref_disp:.6f}>{max_disp_limit}")
-            if not stress_ok:
-                reason.append(f"{len(failed)} stress fail")
-            log_callback(f"  Infeasible ({', '.join(reason)}): {n_increase} PSHELL kalınlaştırıldı (en hassas olanlar).")
-
-    log_callback(f"\n{'='*50}")
-    log_callback("SON ÇÖZÜM")
-    final_dir = os.path.join(output_dir, "final_result")
-    final_disp, final_stress = solve_and_evaluate(
-        nastran_exe, bdf_path, current_t, final_dir, log_callback, memory_mb=memory_mb
-    )
-    stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
-    tracker.record("Final", current_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
-
-    progress_callback(100)
-    return current_t, final_disp, final_stress
-
-
-# ---------------------------------------------------------------------------
-# ALGORİTMA 2: SciPy Minimize (SLSQP)
-# ---------------------------------------------------------------------------
-
-def optimize_scipy(bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                   min_t, max_t, step, max_disp_limit, max_iter,
-                   log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0):
-    from scipy.optimize import minimize
-
-    n = len(pids)
-    eval_count = [0]
-    log_callback(f"\n  SciPy SLSQP - {n} PSHELL")
-
-    def objective(x):
-        return np.sum(x)
-
-    def disp_constraint(x):
-        eval_count[0] += 1
-        t_map = {pid: float(x[i]) for i, pid in enumerate(pids)}
-        work_dir = os.path.join(output_dir, f"scipy_eval{eval_count[0]}")
-        log_callback(f"\n  Eval #{eval_count[0]}: sum(t) = {np.sum(x):.4f}")
-        progress_callback(min(eval_count[0] / max_iter * 100, 99))
-
-        try:
-            max_disp, stress_map = solve_and_evaluate(
-                nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb
-            )
-            stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
-            tracker.record(f"SciPy_{eval_count[0]}", t_map, max_disp, max_vm, stress_ok,
-                           allowable_map, log_callback)
-            return max_disp_limit - max_disp
-        except Exception as exc:
-            log_callback(f"  Nastran hatası: {exc}")
-            return -1.0
-
-    x0 = np.full(n, (min_t + max_t) / 2.0)
-    bounds = [(min_t, max_t)] * n
-    constraints = [{"type": "ineq", "fun": disp_constraint}]
-
-    result = minimize(
-        objective, x0, method="SLSQP", bounds=bounds, constraints=constraints,
-        options={"maxiter": max_iter, "ftol": step / 10, "eps": step},
-    )
-
-    log_callback(f"\n  SciPy sonucu: {result.message}")
-    final_t = {pid: round(float(result.x[i]), 8) for i, pid in enumerate(pids)}
-
-    final_dir = os.path.join(output_dir, "final_result")
-    final_disp, final_stress = solve_and_evaluate(
-        nastran_exe, bdf_path, final_t, final_dir, log_callback, memory_mb=memory_mb
-    )
-    stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
-    tracker.record("Final", final_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
-
-    progress_callback(100)
-    return final_t, final_disp, final_stress
-
-
-# ---------------------------------------------------------------------------
-# ALGORİTMA 3: Hybrid
-# ---------------------------------------------------------------------------
-
-def optimize_hybrid(bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                    min_t, max_t, step, max_disp_limit, max_iter,
-                    log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0):
-    log_callback("\n  AŞAMA 1: Bisection ile başlangıç kalınlığı...")
-
-    low, high = min_t, max_t
-    best_uniform_t = max_t
-    bisect_iter = 0
-    max_bisect = 20
-
-    while high - low > step / 2 and bisect_iter < max_bisect:
-        bisect_iter += 1
-        mid = round((low + high) / 2, 8)
-        t_map = {pid: mid for pid in pids}
-
-        work_dir = os.path.join(output_dir, f"bisect_{bisect_iter}")
-        log_callback(f"\n  Bisection #{bisect_iter}: t = {mid}")
-        progress_callback(bisect_iter / (max_bisect + max_iter) * 100)
-
-        try:
-            max_disp, stress_map = solve_and_evaluate(
-                nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb
-            )
-            stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
-            tracker.record(f"Bisect_{bisect_iter}", t_map, max_disp, max_vm, stress_ok,
-                           allowable_map, log_callback)
-
-            if max_disp <= max_disp_limit and stress_ok:
-                best_uniform_t = mid
-                high = mid
-            else:
-                low = mid
-        except Exception as exc:
-            log_callback(f"    Nastran hatası: {exc}")
-            low = mid
-
-    log_callback(f"\n  Bisection sonucu: t = {best_uniform_t}")
-    log_callback(f"\n  AŞAMA 2: Sensitivity ile ince ayar...")
-
-    remaining_iter = max(3, max_iter - bisect_iter)
-    return optimize_sensitivity(
-        bdf_path, nastran_exe, os.path.join(output_dir, "sensitivity_phase"),
-        pids, allowable_map, min_t, best_uniform_t, step, max_disp_limit, remaining_iter,
-        log_callback, progress_callback, tracker, n_parallel=n_parallel, memory_mb=memory_mb
-    )
-
-
-# ---------------------------------------------------------------------------
-# ALGORİTMA 4: DOE + Surrogate Model
-# ---------------------------------------------------------------------------
-
-def latin_hypercube_sampling(n_samples, n_vars, min_vals, max_vals, seed=42):
-    rng = np.random.RandomState(seed)
-    result = np.zeros((n_samples, n_vars))
-    for j in range(n_vars):
-        cut = np.linspace(0, 1, n_samples + 1)
-        uniform_samples = rng.uniform(low=cut[:-1], high=cut[1:])
-        rng.shuffle(uniform_samples)
-        result[:, j] = min_vals[j] + uniform_samples * (max_vals[j] - min_vals[j])
-    return result
-
-
-def optimize_doe_surrogate(bdf_path, nastran_exe, output_dir, pids, allowable_map,
-                           min_t, max_t, step, max_disp_limit, max_iter,
-                           log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0):
-    from sklearn.linear_model import Ridge
-    from sklearn.preprocessing import PolynomialFeatures
-    from scipy.optimize import minimize
-
-    n_vars = len(pids)
-    min_vals = np.full(n_vars, min_t)
-    max_vals = np.full(n_vars, max_t)
-    n_doe_samples = min(max(2 * n_vars + 1, 10), max(max_iter // 2, 5))
-
-    log_callback(f"\n  DOE + Surrogate Model")
-    log_callback(f"  {n_vars} PSHELL, {n_doe_samples} DOE numune, Paralel: {n_parallel}")
-    log_callback(f"\n  AŞAMA 1: Latin Hypercube Sampling...")
-
-    samples = latin_hypercube_sampling(n_doe_samples, n_vars, min_vals, max_vals)
-
-    X_train = []
-    y_disp = []
-
-    if n_parallel > 1:
-        # Paralel DOE çözümleri
-        batch_items = []
-        for i in range(n_doe_samples):
-            t_map = {pid: round(float(samples[i, j]), 8) for j, pid in enumerate(pids)}
-            work_dir = os.path.join(output_dir, f"doe_sample_{i}")
-            batch_items.append((t_map, work_dir))
-
-        log_callback(f"  {n_doe_samples} DOE numune paralel çözülüyor ({n_parallel} worker)...")
-        try:
-            batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb)
-            for i, (t_map, max_disp, stress_map) in enumerate(batch_results):
-                progress_callback((i / n_doe_samples) * 40)
-                stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
-                tracker.record(f"DOE_{i+1}", t_map, max_disp, max_vm, stress_ok,
-                               allowable_map, log_callback)
-                X_train.append(samples[i])
-                y_disp.append(max_disp)
-                log_callback(f"  DOE Numune {i+1}/{n_doe_samples} tamamlandı.")
-        except Exception as exc:
-            log_callback(f"  Paralel DOE hatası: {exc}")
-    else:
-        # Seri DOE çözümleri
-        for i in range(n_doe_samples):
-            t_map = {pid: round(float(samples[i, j]), 8) for j, pid in enumerate(pids)}
-            work_dir = os.path.join(output_dir, f"doe_sample_{i}")
-            log_callback(f"\n  DOE Numune {i+1}/{n_doe_samples}")
-            progress_callback((i / n_doe_samples) * 40)
-
-            try:
-                max_disp, stress_map = solve_and_evaluate(
-                    nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb
-                )
-                stress_ok, _, max_vm = check_stress_constraints(stress_map, allowable_map)
-                tracker.record(f"DOE_{i+1}", t_map, max_disp, max_vm, stress_ok,
-                               allowable_map, log_callback)
-
-                X_train.append(samples[i])
-                y_disp.append(max_disp)
-            except Exception as exc:
-                log_callback(f"    Nastran hatası: {exc}")
-
-    if len(X_train) < 3:
-        raise RuntimeError("Yeterli DOE numunesi çözülemedi!")
-
-    X_train = np.array(X_train)
-    y_disp = np.array(y_disp)
-
-    # DOE CSV
-    doe_rows = []
-    for i in range(len(X_train)):
-        row = {"Sample": i + 1, "MaxDisp": y_disp[i]}
-        for j, pid in enumerate(pids):
-            row[f"PID_{pid}"] = X_train[i, j]
-        doe_rows.append(row)
-    pd.DataFrame(doe_rows).to_csv(os.path.join(output_dir, "doe_samples.csv"), index=False)
-
-    # AŞAMA 2: Surrogate
-    log_callback(f"\n  AŞAMA 2: Surrogate model ile optimizasyon...")
-    remaining_iter = max_iter - n_doe_samples
-    best_t = None
-    best_weight = float('inf')
-
-    for surr_iter in range(max(remaining_iter, 3)):
-        log_callback(f"\n{'='*50}")
-        log_callback(f"SURROGATE İTERASYON {surr_iter + 1}")
-        progress_callback(40 + (surr_iter / max(remaining_iter, 3)) * 50)
-
-        degree = 1 if n_vars > 20 else 2
-        poly = PolynomialFeatures(degree=degree, include_bias=True)
-        X_poly = poly.fit_transform(X_train)
-
-        model = Ridge(alpha=1.0)
-        model.fit(X_poly, y_disp)
-        log_callback(f"  Surrogate R²: {model.score(X_poly, y_disp):.4f}")
-
-        def surrogate_objective(x):
-            return np.sum(x)
-
-        def surrogate_disp_constraint(x):
-            x_poly = poly.transform(x.reshape(1, -1))
-            return max_disp_limit - model.predict(x_poly)[0]
-
-        opt_result = minimize(
-            surrogate_objective, np.mean(X_train, axis=0), method="SLSQP",
-            bounds=[(min_t, max_t)] * n_vars,
-            constraints=[{"type": "ineq", "fun": surrogate_disp_constraint}],
-            options={"maxiter": 200},
-        )
-
-        candidate_t = {pid: round(float(opt_result.x[j]), 8) for j, pid in enumerate(pids)}
-        predicted_disp = model.predict(poly.transform(opt_result.x.reshape(1, -1)))[0]
-        log_callback(f"  Surrogate tahmin: Disp={predicted_disp:.6f}, Weight={np.sum(opt_result.x):.4f}")
-
-        verify_dir = os.path.join(output_dir, f"surrogate_verify_{surr_iter}")
-        try:
-            real_disp, real_stress = solve_and_evaluate(
-                nastran_exe, bdf_path, candidate_t, verify_dir, log_callback, memory_mb=memory_mb
-            )
-            stress_ok, _, max_vm = check_stress_constraints(real_stress, allowable_map)
-            total_mass = tracker.record(f"Surr_{surr_iter+1}", candidate_t, real_disp, max_vm,
-                                        stress_ok, allowable_map, log_callback)
-
-            error = abs(real_disp - predicted_disp)
-            log_callback(f"  Tahmin hatası: {error:.6f} ({error/max(real_disp,1e-9)*100:.1f}%)")
-
-            X_train = np.vstack([X_train, opt_result.x.reshape(1, -1)])
-            y_disp = np.append(y_disp, real_disp)
-
-            if real_disp <= max_disp_limit and stress_ok and total_mass < best_weight:
-                best_t = dict(candidate_t)
-                best_weight = total_mass
-                log_callback(f"  *** YENİ EN İYİ: Mass={best_weight:.4f} kg")
-
-            if error < step / 10 and real_disp <= max_disp_limit and stress_ok:
-                log_callback(f"  Yakınsadı!")
-                break
-        except Exception as exc:
-            log_callback(f"  Doğrulama hatası: {exc}")
-
-    if best_t is None:
-        best_idx = np.argmin(y_disp)
-        best_t = {pid: round(float(X_train[best_idx, j]), 8) for j, pid in enumerate(pids)}
-
-    log_callback(f"\n{'='*50}")
-    log_callback("SON ÇÖZÜM")
-    final_dir = os.path.join(output_dir, "final_result")
-    final_disp, final_stress = solve_and_evaluate(
-        nastran_exe, bdf_path, best_t, final_dir, log_callback, memory_mb=memory_mb
-    )
-    stress_ok, _, max_vm = check_stress_constraints(final_stress, allowable_map)
-    tracker.record("Final", best_t, final_disp, max_vm, stress_ok, allowable_map, log_callback)
-
-    progress_callback(100)
-    return best_t, final_disp, final_stress
-
-
-# ---------------------------------------------------------------------------
-# ALGORİTMA 5: Forward Difference + SciPy SQP (trust-constr)
+# ALGORİTMA 1: Forward Difference + SciPy SQP (trust-constr)
 # ---------------------------------------------------------------------------
 
 def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
@@ -981,7 +542,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
 
 # ---------------------------------------------------------------------------
-# ALGORİTMA 6: Genetic Algorithm (GA)
+# ALGORİTMA 2: Genetic Algorithm (GA)
 # ---------------------------------------------------------------------------
 
 def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
@@ -1307,14 +868,10 @@ class NastranToolApp:
         self.algo_var = tk.StringVar()
         algo_combo = ttk.Combobox(param_frame, textvariable=self.algo_var, state="readonly", width=32)
         algo_combo["values"] = (
-            "Sensitivity-Based",
-            "SciPy Minimize (SLSQP)",
-            "Hybrid (Bisection + Sensitivity)",
-            "DOE + Surrogate Model",
             "FD + SQP (Forward Difference)",
             "Genetic Algorithm (GA)",
         )
-        algo_combo.current(4)
+        algo_combo.current(0)
         algo_combo.grid(row=3, column=1, columnspan=4, sticky=tk.W, padx=2, pady=(4, 0))
 
         main_frame.columnconfigure(1, weight=1)
@@ -1444,46 +1001,7 @@ class NastranToolApp:
         n_steps = int(round(t_range / step))  # bir PSHELL'in max-min arası adım sayısı
 
         # Algoritma bazlı tahmini run hesabı
-        if "Sensitivity" in algo_name and "Hybrid" not in algo_name:
-            # Her iterasyonda max n_pids/2 PSHELL bir step azalır.
-            # Tüm PSHELL'ler min_t'ye ulaştığında durur.
-            # max_meaningful_iter = ceil(2 * n_steps) (her PSHELL n_steps adımda min'e iner,
-            # her iter'de yarısı azalır -> 2*n_steps iter yeterli)
-            max_meaningful = math.ceil(2 * n_steps)
-            eff_iter = min(max_iter, max_meaningful)
-            total_run = (1 + n_pids) * eff_iter + 1
-            detail = (f"({1 + n_pids}) x {eff_iter} iter + 1 final"
-                      f"  [max_iter={max_iter}, t_adım={n_steps}, eff_iter=min({max_iter},{max_meaningful})]")
-
-        elif "SciPy" in algo_name:
-            # Optimizer kontrollü, en fazla ~max_iter constraint eval + 1 final
-            # eps=step: büyük step -> daha kaba FD -> daha az iter
-            total_run = max_iter + 1
-            detail = f"~{max_iter} eval + 1 final (optimizer kontrollü, eps={step})"
-
-        elif "Hybrid" in algo_name:
-            # Faz 1: Bisection: high-low > step/2 olana kadar ikiye böler
-            # bisect_count = min(20, ceil(log2(2 * t_range / step)))
-            if t_range > 0 and step > 0:
-                bisect_count = min(20, math.ceil(math.log2(2 * t_range / step)))
-            else:
-                bisect_count = 20
-            # Faz 2: Sensitivity kalan iterasyonlarla
-            remaining_sens = max(3, max_iter - bisect_count)
-            max_meaningful_sens = math.ceil(2 * n_steps)
-            eff_sens = min(remaining_sens, max_meaningful_sens)
-            total_run = bisect_count + (1 + n_pids) * eff_sens + 1
-            detail = (f"{bisect_count} bisect + ({1 + n_pids}) x {eff_sens} sens + 1 final"
-                      f"  [bisect=min(20,ceil(log2(2*{t_range:.1f}/{step})))={bisect_count}]")
-
-        elif "DOE" in algo_name:
-            # DOE samples + surrogate verification + 1 final
-            n_doe = min(max(2 * n_pids + 1, 10), max(max_iter // 2, 5))
-            remaining = max(max_iter - n_doe, 3)
-            total_run = n_doe + remaining + 1
-            detail = f"{n_doe} DOE + {remaining} verify + 1 final"
-
-        elif "FD" in algo_name or "SQP" in algo_name:
+        if "FD" in algo_name or "SQP" in algo_name:
             # Her iterasyonda: 1 ref + n_pids FD pertürbasyon
             # gtol=step/10: küçük step -> daha hassas -> daha çok iter
             # Ancak optimizer max_iter'den fazla çalışmaz
@@ -1665,21 +1183,13 @@ class NastranToolApp:
                 tracker=tracker, n_parallel=n_parallel, memory_mb=memory_mb,
             )
 
-            if "DOE" in algo_name:
-                result_t, final_disp, final_stress = optimize_doe_surrogate(**algo_kwargs)
-            elif "FD" in algo_name or "SQP" in algo_name:
+            if "FD" in algo_name or "SQP" in algo_name:
                 result_t, final_disp, final_stress = optimize_fd_sqp(**algo_kwargs)
-            elif "Genetic" in algo_name or "GA" in algo_name:
+            else:
                 algo_kwargs["pid_mid_map"] = pid_mid_map
                 algo_kwargs["mid_density_map"] = mid_density_map
                 algo_kwargs["pid_area_map"] = pid_area_map
                 result_t, final_disp, final_stress = optimize_genetic(**algo_kwargs)
-            elif "Sensitivity" in algo_name and "Hybrid" not in algo_name:
-                result_t, final_disp, final_stress = optimize_sensitivity(**algo_kwargs)
-            elif "SciPy" in algo_name:
-                result_t, final_disp, final_stress = optimize_scipy(**algo_kwargs)
-            else:
-                result_t, final_disp, final_stress = optimize_hybrid(**algo_kwargs)
 
             # Sonuç raporu
             self._log(f"\n{'='*60}")

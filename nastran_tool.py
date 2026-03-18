@@ -283,12 +283,28 @@ def extract_results_csv(op2_model, output_dir, label, log_callback):
         log_callback(f"  Disp CSV: {csv_path} ({len(df)} satır)")
 
 
-def load_allowable_excel(excel_path):
-    df = pd.read_excel(excel_path, sheet_name=0)
+def load_allowable_excel(excel_path, sheet_name="Stress Allowable(Element Based)"):
+    df = pd.read_excel(excel_path, sheet_name=sheet_name)
     df.columns = [c.strip() for c in df.columns]
-    eid_col = df.columns[0]
+    id_col = df.columns[0]
     allow_col = df.columns[1]
-    return {int(row[eid_col]): float(row[allow_col]) for _, row in df.iterrows()}
+    return {int(row[id_col]): float(row[allow_col]) for _, row in df.iterrows()}
+
+
+def load_thickness_range_excel(excel_path):
+    """Thickness Range sayfasından PID bazlı tmin, tmax, step okur.
+    Returns: {pid: (tmin, tmax, step)}
+    """
+    df = pd.read_excel(excel_path, sheet_name="Thickness Range")
+    df.columns = [c.strip() for c in df.columns]
+    result = {}
+    for _, row in df.iterrows():
+        pid = int(row[df.columns[0]])
+        tmin = float(row[df.columns[1]])
+        tmax = float(row[df.columns[2]])
+        step = float(row[df.columns[3]])
+        result[pid] = (tmin, tmax, step)
+    return result
 
 
 def check_stress_constraints(stress_map, allowable_map):
@@ -429,13 +445,26 @@ class IterationTracker:
 
 def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
-                    log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0):
+                    log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
+                    pid_bounds=None):
     """Forward Difference ile gradyan hesaplayıp SciPy trust-constr (SQP) ile optimize eder."""
     from scipy.optimize import minimize, NonlinearConstraint
 
     n = len(pids)
     eval_count = [0]
     cache = {}
+
+    # Per-PID bounds
+    if pid_bounds:
+        bounds_list = [pid_bounds[pid] for pid in pids]  # [(tmin, tmax, step), ...]
+        pid_min = np.array([b[0] for b in bounds_list])
+        pid_max = np.array([b[1] for b in bounds_list])
+        pid_step = np.array([b[2] for b in bounds_list])
+    else:
+        pid_min = np.full(n, min_t)
+        pid_max = np.full(n, max_t)
+        pid_step = np.full(n, step)
+
     log_callback(f"\n  FD + SQP - {n} PSHELL, Paralel: {n_parallel}")
 
     def _eval_point(x, label_prefix="fd"):
@@ -486,8 +515,8 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             batch_items = []
             for i in range(n):
                 x_pert = x0.copy()
-                x_pert[i] += step
-                x_pert[i] = min(x_pert[i], max_t)
+                x_pert[i] += pid_step[i]
+                x_pert[i] = min(x_pert[i], pid_max[i])
                 t_map = {pid: float(x_pert[j]) for j, pid in enumerate(pids)}
                 w_dir = os.path.join(output_dir, f"fd_grad_{eval_count[0]}_p{i}")
                 batch_items.append((t_map, w_dir))
@@ -495,23 +524,23 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb)
             grad = np.zeros(n)
             for i, (_, pert_disp, _) in enumerate(batch_results):
-                grad[i] = (pert_disp - f0) / step
+                grad[i] = (pert_disp - f0) / pid_step[i]
                 log_callback(f"    PID {pids[i]}: dDisp/dT = {grad[i]:.6f}")
         else:
             # Seri FD
             grad = np.zeros(n)
             for i in range(n):
                 x_pert = x0.copy()
-                x_pert[i] += step
-                x_pert[i] = min(x_pert[i], max_t)
+                x_pert[i] += pid_step[i]
+                x_pert[i] = min(x_pert[i], pid_max[i])
                 fi, _ = _eval_point(x_pert, "fd_pert")
-                grad[i] = (fi - f0) / step
+                grad[i] = (fi - f0) / pid_step[i]
                 log_callback(f"    PID {pids[i]}: dDisp/dT = {grad[i]:.6f}")
 
         return grad
 
-    x0 = np.full(n, (min_t + max_t) / 2.0)
-    bounds = [(min_t, max_t)] * n
+    x0 = np.array([(pid_min[i] + pid_max[i]) / 2.0 for i in range(n)])
+    bounds = [(pid_min[i], pid_max[i]) for i in range(n)]
 
     disp_constr = NonlinearConstraint(
         disp_constraint_fun, -np.inf, max_disp_limit,
@@ -524,7 +553,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         jac=objective_grad,
         bounds=bounds,
         constraints=[disp_constr],
-        options={"maxiter": max_iter, "verbose": 0, "gtol": step / 10},
+        options={"maxiter": max_iter, "verbose": 0, "gtol": float(np.min(pid_step)) / 10},
     )
 
     log_callback(f"\n  SQP sonucu: {result.message}")
@@ -548,10 +577,22 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                      min_t, max_t, step, max_disp_limit, max_iter,
                      log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
-                     pid_mid_map=None, mid_density_map=None, pid_area_map=None):
+                     pid_mid_map=None, mid_density_map=None, pid_area_map=None,
+                     pid_bounds=None):
     """Genetik Algoritma ile kalınlık optimizasyonu."""
     n = len(pids)
     eval_count = [0]
+
+    # Per-PID bounds
+    if pid_bounds:
+        bounds_list = [pid_bounds[pid] for pid in pids]
+        pid_min = np.array([b[0] for b in bounds_list])
+        pid_max = np.array([b[1] for b in bounds_list])
+        pid_step = np.array([b[2] for b in bounds_list])
+    else:
+        pid_min = np.full(n, min_t)
+        pid_max = np.full(n, max_t)
+        pid_step = np.full(n, step)
 
     # GA parametreleri
     pop_size = max(10, 2 * n)
@@ -594,7 +635,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     # İlk popülasyonu oluştur (Latin Hypercube benzeri)
     population = np.zeros((pop_size, n))
     for j in range(n):
-        vals = np.linspace(min_t, max_t, pop_size)
+        vals = np.linspace(pid_min[j], pid_max[j], pop_size)
         rng.shuffle(vals)
         population[:, j] = vals
 
@@ -726,12 +767,12 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
             # Mutasyon
             if rng.random() < mutation_rate:
                 mut_idx = rng.randint(0, n)
-                child[mut_idx] += rng.normal(0, (max_t - min_t) * 0.1)
+                child[mut_idx] += rng.normal(0, (pid_max[mut_idx] - pid_min[mut_idx]) * 0.1)
 
             # Sınırları uygula ve step'e yuvarla
-            child = np.clip(child, min_t, max_t)
-            child = np.round(child / step) * step
-            child = np.clip(child, min_t, max_t)
+            child = np.clip(child, pid_min, pid_max)
+            child = np.round(child / pid_step) * pid_step
+            child = np.clip(child, pid_min, pid_max)
             new_population[i] = child
 
         population = new_population
@@ -826,6 +867,8 @@ class NastranToolApp:
         self.root.title("Eray-Tool | NX Nastran Thickness Optimizasyon Aracı")
         self.root.geometry("1100x750")
         self.root.resizable(True, True)
+        self.use_excel_thickness = False
+        self.thickness_range_data = None
         self._build_ui()
 
     def _build_ui(self):
@@ -899,6 +942,12 @@ class NastranToolApp:
         self.step_entry = ttk.Entry(param_frame, width=8)
         self.step_entry.grid(row=0, column=5, padx=2)
         self.step_entry.insert(0, "0.1")
+
+        self.excel_thickness_btn = ttk.Button(
+            param_frame, text="Excel'den T Oku",
+            command=self._toggle_excel_thickness
+        )
+        self.excel_thickness_btn.grid(row=0, column=6, padx=4)
 
         ttk.Label(param_frame, text="Max Disp:").grid(row=1, column=0, sticky=tk.W, padx=2, pady=(4, 0))
         self.max_disp_entry = ttk.Entry(param_frame, width=8)
@@ -999,6 +1048,36 @@ class NastranToolApp:
         self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.canvas.draw()
+
+    def _toggle_excel_thickness(self):
+        """Excel'den Thickness Range okuma modunu aç/kapat."""
+        excel_path = self.excel_entry.get().strip()
+        if not excel_path or not os.path.isfile(excel_path):
+            messagebox.showerror("Hata", "Oncelikle Allowable Excel dosyasini seciniz.")
+            return
+
+        if not self.use_excel_thickness:
+            try:
+                self.thickness_range_data = load_thickness_range_excel(excel_path)
+                if not self.thickness_range_data:
+                    messagebox.showerror("Hata", "Thickness Range sayfasi bos!")
+                    return
+                self.use_excel_thickness = True
+                self.min_t_entry.configure(state=tk.DISABLED)
+                self.max_t_entry.configure(state=tk.DISABLED)
+                self.step_entry.configure(state=tk.DISABLED)
+                self.excel_thickness_btn.configure(text="Manuel T'ye Don")
+                self._log(f"  Excel'den {len(self.thickness_range_data)} PID icin thickness range yuklendi.")
+            except Exception as exc:
+                messagebox.showerror("Hata", f"Thickness Range okunamadi: {exc}")
+        else:
+            self.use_excel_thickness = False
+            self.thickness_range_data = None
+            self.min_t_entry.configure(state=tk.NORMAL)
+            self.max_t_entry.configure(state=tk.NORMAL)
+            self.step_entry.configure(state=tk.NORMAL)
+            self.excel_thickness_btn.configure(text="Excel'den T Oku")
+            self._log("  Manuel thickness parametrelerine geri donuldu.")
 
     def _update_plot(self, iterations, masses, displacements, max_disp_limit):
         """Thread-safe grafik güncelleme."""
@@ -1189,10 +1268,26 @@ class NastranToolApp:
             messagebox.showerror("Hata", "Stress allowable Excel dosyası seçiniz.")
             return
 
+        thickness_range_data = None
+        if self.use_excel_thickness and self.thickness_range_data:
+            thickness_range_data = self.thickness_range_data
+            # Excel modunda dummy değerler (kullanılmayacak, per-PID'den alınacak)
+            min_t = 0.0
+            max_t = 1.0
+            step = 0.1
+        else:
+            try:
+                min_t = float(self.min_t_entry.get().strip())
+                max_t = float(self.max_t_entry.get().strip())
+                step = float(self.step_entry.get().strip())
+            except ValueError:
+                messagebox.showerror("Hata", "Parametre değerleri sayısal olmalıdır.")
+                return
+            if min_t >= max_t or step <= 0:
+                messagebox.showerror("Hata", "Min < Max ve Step > 0 olmalıdır.")
+                return
+
         try:
-            min_t = float(self.min_t_entry.get().strip())
-            max_t = float(self.max_t_entry.get().strip())
-            step = float(self.step_entry.get().strip())
             max_disp_limit = float(self.max_disp_entry.get().strip())
             max_iter = int(self.max_iter_entry.get().strip())
             n_parallel = int(self.n_parallel_entry.get().strip())
@@ -1203,10 +1298,6 @@ class NastranToolApp:
                 memory_mb = 0
         except ValueError:
             messagebox.showerror("Hata", "Parametre değerleri sayısal olmalıdır.")
-            return
-
-        if min_t >= max_t or step <= 0:
-            messagebox.showerror("Hata", "Min < Max ve Step > 0 olmalıdır.")
             return
 
         algo_name = self.algo_var.get()
@@ -1226,18 +1317,21 @@ class NastranToolApp:
             target=self._opt_worker,
             args=(bdf_path, nastran_exe, output_dir, excel_path,
                   min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
-                  retain_mode),
+                  retain_mode, thickness_range_data),
             daemon=True,
         ).start()
 
     def _opt_worker(self, bdf_path, nastran_exe, output_dir, excel_path,
                     min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
-                    retain_mode="all"):
+                    retain_mode="all", thickness_range_data=None):
         try:
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
-            self._log(f"  Min: {min_t}  Max: {max_t}  Step: {step}")
-            self._log(f"  Max Disp: {max_disp_limit}  Max İter: {max_iter}  Paralel: {n_parallel}  Memory: {memory_mb}mb" if memory_mb > 0 else f"  Max Disp: {max_disp_limit}  Max İter: {max_iter}  Paralel: {n_parallel}")
+            if thickness_range_data:
+                self._log(f"  Thickness: Excel'den PID bazli (Thickness Range)")
+            else:
+                self._log(f"  Min: {min_t}  Max: {max_t}  Step: {step}")
+            self._log(f"  Max Disp: {max_disp_limit}  Max Iter: {max_iter}  Paralel: {n_parallel}  Memory: {memory_mb}mb" if memory_mb > 0 else f"  Max Disp: {max_disp_limit}  Max Iter: {max_iter}  Paralel: {n_parallel}")
             self._log("=" * 60)
 
             # BDF'den PSHELL, malzeme ve alan bilgisi oku
@@ -1249,6 +1343,25 @@ class NastranToolApp:
             self._log(f"  {len(mid_density_map)} malzeme density yüklendi")
             total_area = sum(pid_area_map.values())
             self._log(f"  Toplam eleman alanı: {total_area:.4f}")
+
+            # Excel'den PID bazli thickness range varsa, per-PID bounds olustur
+            if thickness_range_data:
+                pid_bounds = {}
+                for pid in pids:
+                    if pid in thickness_range_data:
+                        pid_bounds[pid] = thickness_range_data[pid]
+                    else:
+                        pid_bounds[pid] = (min_t, max_t, step)
+                        self._log(f"  UYARI: PID {pid} Excel'de yok, varsayilan degerler kullanilacak.")
+                # Global min/max/step algoritmaya geçmek için ortalamaları al
+                all_mins = [pid_bounds[p][0] for p in pids]
+                all_maxs = [pid_bounds[p][1] for p in pids]
+                all_steps = [pid_bounds[p][2] for p in pids]
+                min_t = min(all_mins)
+                max_t = max(all_maxs)
+                step = min(all_steps)
+            else:
+                pid_bounds = {pid: (min_t, max_t, step) for pid in pids}
 
             allowable_map = load_allowable_excel(excel_path)
             self._log(f"  {len(allowable_map)} element allowable yüklendi.")
@@ -1267,6 +1380,7 @@ class NastranToolApp:
                 max_disp_limit=max_disp_limit, max_iter=max_iter,
                 log_callback=self._log, progress_callback=self._set_progress,
                 tracker=tracker, n_parallel=n_parallel, memory_mb=memory_mb,
+                pid_bounds=pid_bounds,
             )
 
             if "FD" in algo_name or "SQP" in algo_name:

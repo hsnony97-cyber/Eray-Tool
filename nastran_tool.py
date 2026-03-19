@@ -194,14 +194,22 @@ def modify_pshell_thicknesses(bdf_path, output_bdf_path, thickness_map, log_call
 # Nastran çalıştırma
 # ---------------------------------------------------------------------------
 
-def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0):
+def run_nastran(nastran_exe, bdf_path, output_dir, log_callback, memory_mb=0, scratch_dir=None):
     bdf_basename = os.path.splitext(os.path.basename(bdf_path))[0]
     op2_path = os.path.join(output_dir, bdf_basename + ".op2")
 
     cmd = [nastran_exe, bdf_path, f"out={output_dir}{os.sep}{bdf_basename}"]
     if memory_mb > 0:
         cmd.append(f"mem={memory_mb}mb")
-    log_callback(f"  Nastran: {bdf_basename}" + (f" (mem={memory_mb}mb)" if memory_mb > 0 else ""))
+    if scratch_dir:
+        # Her run icin run klasoru adiyla ayni scratch alt klasoru olustur
+        run_scratch = os.path.join(scratch_dir, os.path.basename(output_dir))
+        os.makedirs(run_scratch, exist_ok=True)
+        cmd.append("scr=yes")
+        cmd.append(f"sdir={run_scratch}")
+        log_callback(f"  Nastran: {bdf_basename}" + (f" (mem={memory_mb}mb)" if memory_mb > 0 else "") + f" (scratch={run_scratch})")
+    else:
+        log_callback(f"  Nastran: {bdf_basename}" + (f" (mem={memory_mb}mb)" if memory_mb > 0 else ""))
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=output_dir)
 
@@ -411,14 +419,14 @@ def log_mass_summary(total_mass, max_disp, max_disp_limit, max_vm, stress_ok, lo
     log_callback("")
 
 
-def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=0):
+def solve_and_evaluate(nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=0, scratch_dir=None):
     """BDF'yi değiştir, çöz, sonuçları oku, CSV yaz, OP2 ve büyük dosyaları sil."""
     os.makedirs(work_dir, exist_ok=True)
     bdf_basename = os.path.basename(bdf_path)
     modified_bdf = os.path.join(work_dir, bdf_basename)
     modify_pshell_thicknesses(bdf_path, modified_bdf, thickness_map, log_callback)
 
-    op2_path = run_nastran(nastran_exe, modified_bdf, work_dir, log_callback, memory_mb=memory_mb)
+    op2_path = run_nastran(nastran_exe, modified_bdf, work_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir)
     op2_model = OP2()
     op2_model.read_op2(op2_path)
 
@@ -451,7 +459,7 @@ def cleanup_nastran_outputs(work_dir, log_callback):
         log_callback(f"  {deleted} Nastran çıktı dosyası silindi.")
 
 
-def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=0):
+def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=0, scratch_dir=None):
     """
     Birden fazla thickness kombinasyonunu paralel olarak çözer.
     batch_items: [(thickness_map, work_dir), ...]
@@ -461,7 +469,7 @@ def solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, me
 
     def _solve_one(idx, thickness_map, work_dir):
         max_disp, stress_map = solve_and_evaluate(
-            nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=memory_mb
+            nastran_exe, bdf_path, thickness_map, work_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir
         )
         return idx, thickness_map, max_disp, stress_map
 
@@ -525,7 +533,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                     min_t, max_t, step, max_disp_limit, max_iter,
                     log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
                     pid_bounds=None, stress_mode="Element Based", sigma_count=0,
-                    eid_pid_map=None, eid_area_map=None):
+                    eid_pid_map=None, eid_area_map=None, scratch_dir=None):
     """Forward Difference ile gradyan hesaplayıp SciPy trust-constr (SQP) ile optimize eder."""
     from scipy.optimize import minimize, NonlinearConstraint
 
@@ -556,7 +564,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
         work_dir = os.path.join(output_dir, f"{label_prefix}_eval{eval_count[0]}")
         try:
             max_disp, stress_map = solve_and_evaluate(
-                nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb
+                nastran_exe, bdf_path, t_map, work_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir
             )
             stress_ok, _, max_vm = do_stress_check(
                 stress_map, allowable_map, stress_mode, sigma_count,
@@ -602,7 +610,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 w_dir = os.path.join(output_dir, f"fd_grad_{eval_count[0]}_p{i}")
                 batch_items.append((t_map, w_dir))
 
-            batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb)
+            batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir)
             grad = np.zeros(n)
             for i, (_, pert_disp, _) in enumerate(batch_results):
                 grad[i] = (pert_disp - f0) / pid_step[i]
@@ -642,7 +650,7 @@ def optimize_fd_sqp(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
     final_dir = os.path.join(output_dir, "final_result")
     final_disp, final_stress = solve_and_evaluate(
-        nastran_exe, bdf_path, final_t, final_dir, log_callback, memory_mb=memory_mb
+        nastran_exe, bdf_path, final_t, final_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir
     )
     stress_ok, _, max_vm = do_stress_check(
         final_stress, allowable_map, stress_mode, sigma_count,
@@ -662,7 +670,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                      log_callback, progress_callback, tracker, n_parallel=1, memory_mb=0,
                      pid_mid_map=None, mid_density_map=None, pid_area_map=None,
                      pid_bounds=None, stress_mode="Element Based", sigma_count=0,
-                     eid_pid_map=None, eid_area_map=None):
+                     eid_pid_map=None, eid_area_map=None, scratch_dir=None):
     """Genetik Algoritma ile kalınlık optimizasyonu."""
     n = len(pids)
     eval_count = [0]
@@ -755,7 +763,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 
             log_callback(f"  {pop_size} birey paralel değerlendiriliyor...")
             try:
-                batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb)
+                batch_results = solve_batch(nastran_exe, bdf_path, batch_items, n_parallel, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir)
                 for i, (t_map, max_disp, stress_map) in enumerate(batch_results):
                     stress_ok, _, max_vm = do_stress_check(
                         stress_map, allowable_map, stress_mode, sigma_count,
@@ -779,7 +787,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
                 w_dir = os.path.join(output_dir, f"ga_gen{gen}_ind{i}")
                 try:
                     max_disp, stress_map = solve_and_evaluate(
-                        nastran_exe, bdf_path, t_maps[i], w_dir, log_callback, memory_mb=memory_mb
+                        nastran_exe, bdf_path, t_maps[i], w_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir
                     )
                     stress_ok, _, max_vm = do_stress_check(
                         stress_map, allowable_map, stress_mode, sigma_count,
@@ -872,7 +880,7 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
     log_callback("SON ÇÖZÜM")
     final_dir = os.path.join(output_dir, "final_result")
     final_disp, final_stress = solve_and_evaluate(
-        nastran_exe, bdf_path, best_t, final_dir, log_callback, memory_mb=memory_mb
+        nastran_exe, bdf_path, best_t, final_dir, log_callback, memory_mb=memory_mb, scratch_dir=scratch_dir
     )
     stress_ok, _, max_vm = do_stress_check(
         final_stress, allowable_map, stress_mode, sigma_count,
@@ -886,6 +894,26 @@ def optimize_genetic(bdf_path, nastran_exe, output_dir, pids, allowable_map,
 # ---------------------------------------------------------------------------
 # Çıktı dosyası temizleme (saklama moduna göre)
 # ---------------------------------------------------------------------------
+
+def cleanup_scratch_dir(scratch_dir, log_callback):
+    """Analiz sonrasi scratch klasorunun icerigini tamamen siler."""
+    import shutil
+    if not scratch_dir or not os.path.isdir(scratch_dir):
+        return
+    deleted = 0
+    for item in os.listdir(scratch_dir):
+        item_path = os.path.join(scratch_dir, item)
+        try:
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
+            deleted += 1
+        except OSError:
+            pass
+    if deleted:
+        log_callback(f"  Scratch klasoru temizlendi: {deleted} oge silindi ({scratch_dir})")
+
 
 def cleanup_iteration_outputs(output_dir, retain_mode, tracker, max_disp_limit,
                               allowable_map, log_callback):
@@ -997,6 +1025,14 @@ class NastranToolApp:
         self.output_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
         ttk.Button(main_frame, text="Seç...", command=lambda: select_directory(
             self.output_entry, "Çıktı Klasörü Seçiniz"
+        )).grid(row=row, column=3)
+
+        row += 1
+        ttk.Label(main_frame, text="Scratch Klasörü:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.scratch_entry = ttk.Entry(main_frame, width=45)
+        self.scratch_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, padx=4)
+        ttk.Button(main_frame, text="Seç...", command=lambda: select_directory(
+            self.scratch_entry, "Scratch Klasörü Seçiniz"
         )).grid(row=row, column=3)
 
         row += 1
@@ -1442,6 +1478,8 @@ class NastranToolApp:
         stress_mode = self.stress_mode_var.get()
         sigma_count = self.sigma_var.get() if stress_mode == "Average Stress" else 0
 
+        scratch_dir = self.scratch_entry.get().strip() or None
+
         self._disable_buttons()
         self.progress.configure(mode="determinate", value=0)
 
@@ -1449,14 +1487,14 @@ class NastranToolApp:
             target=self._opt_worker,
             args=(bdf_path, nastran_exe, output_dir, excel_path,
                   min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
-                  retain_mode, thickness_range_data, stress_mode, sigma_count),
+                  retain_mode, thickness_range_data, stress_mode, sigma_count, scratch_dir),
             daemon=True,
         ).start()
 
     def _opt_worker(self, bdf_path, nastran_exe, output_dir, excel_path,
                     min_t, max_t, step, max_disp_limit, max_iter, algo_name, n_parallel, memory_mb,
                     retain_mode="all", thickness_range_data=None,
-                    stress_mode="Element Based", sigma_count=0):
+                    stress_mode="Element Based", sigma_count=0, scratch_dir=None):
         try:
             self._log("=" * 60)
             self._log(f"OPTİMİZASYON: {algo_name}")
@@ -1465,6 +1503,8 @@ class NastranToolApp:
             else:
                 self._log(f"  Min: {min_t}  Max: {max_t}  Step: {step}")
             self._log(f"  Max Disp: {max_disp_limit}  Max Iter: {max_iter}  Paralel: {n_parallel}  Memory: {memory_mb}mb" if memory_mb > 0 else f"  Max Disp: {max_disp_limit}  Max Iter: {max_iter}  Paralel: {n_parallel}")
+            if scratch_dir:
+                self._log(f"  Scratch: {scratch_dir}")
             self._log("=" * 60)
 
             # BDF'den PSHELL, malzeme ve alan bilgisi oku
@@ -1529,6 +1569,7 @@ class NastranToolApp:
                 pid_bounds=pid_bounds,
                 stress_mode=stress_mode, sigma_count=sigma_count,
                 eid_pid_map=eid_pid_map, eid_area_map=eid_area_map,
+                scratch_dir=scratch_dir,
             )
 
             if "FD" in algo_name or "SQP" in algo_name:
@@ -1599,6 +1640,10 @@ class NastranToolApp:
                 output_dir, retain_mode, tracker, max_disp_limit,
                 allowable_map, self._log
             )
+
+            # Scratch klasorunu temizle
+            if scratch_dir:
+                cleanup_scratch_dir(scratch_dir, self._log)
 
             self._log("\nİŞLEM TAMAMLANDI!")
             self.root.after(0, lambda: messagebox.showinfo(
